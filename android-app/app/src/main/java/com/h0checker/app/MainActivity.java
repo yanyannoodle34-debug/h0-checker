@@ -32,19 +32,17 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Fullscreen immersive
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         getWindow().setFlags(
             WindowManager.LayoutParams.FLAG_FULLSCREEN,
             WindowManager.LayoutParams.FLAG_FULLSCREEN
         );
 
-        setContentView(getResources().getIdentifier("activity_main", "layout", getPackageName()));
+        setContentView(R.layout.activity_main);
 
-        webView = findViewById(getResources().getIdentifier("webView", "id", getPackageName()));
-        progressBar = findViewById(getResources().getIdentifier("progressBar", "id", getPackageName()));
+        webView = findViewById(R.id.webView);
+        progressBar = findViewById(R.id.progressBar);
 
-        // WebView settings
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
@@ -57,26 +55,21 @@ public class MainActivity extends Activity {
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         settings.setMediaPlaybackRequiresUserGesture(false);
 
-        // Enable cookies
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
 
-        // Dark status bar
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             getWindow().setStatusBarColor(0xFF0A0A0F);
             getWindow().setNavigationBarColor(0xFF0A0A0F);
         }
 
-        // WebViewClient - handle navigation
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 String url = request.getUrl().toString();
-                // Keep internal navigation in WebView
                 if (url.startsWith("http://10.0.2.2") || url.startsWith("http://localhost")) {
                     return false;
                 }
-                // External links open in browser
                 Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
                 startActivity(intent);
                 return true;
@@ -88,7 +81,6 @@ public class MainActivity extends Activity {
             }
         });
 
-        // WebChromeClient - progress + file upload
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onProgressChanged(WebView view, int newProgress) {
@@ -117,10 +109,7 @@ public class MainActivity extends Activity {
             }
         });
 
-        // Hardware acceleration
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
-
-        // Load the server
         webView.loadUrl(SERVER_URL);
     }
 
