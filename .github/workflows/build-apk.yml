@@ -27,7 +27,7 @@ jobs:
       - name: Copy web assets to Android
         run: |
           rm -rf android-app/client
-          cp -r client/dist android-app/client
+          cp -r dist/public android-app/client
           echo "Web assets copied:"
           find android-app/client -type f | wc -l
           echo "files, total size:"
