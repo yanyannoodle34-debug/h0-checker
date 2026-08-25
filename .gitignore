@@ -11,3 +11,11 @@ vite.config.ts.*
 .config/
 .local/
 Githubtok.json
+
+# Android build artifacts
+android-app/app/build/
+android-app/build/
+android-app/.gradle/
+android-app/local.properties
+android-app/gradlew
+android-app/gradlew.bat
