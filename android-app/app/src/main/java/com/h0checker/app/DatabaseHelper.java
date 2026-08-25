@@ -588,50 +588,30 @@ public class DatabaseHelper extends SQLiteOpenHelper {
     public JSONObject getDashboardStats() {
         JSONObject result = new JSONObject();
         try {
-            JSONObject stats = getStats();
-            JSONObject gateStats = new JSONObject();
-            Cursor c1 = getReadableDatabase().rawQuery("SELECT COUNT(*) FROM gate_configs", null);
-            int totalGates = 0; if (c1.moveToFirst()) totalGates = c1.getInt(0); c1.close();
-            Cursor c2 = getReadableDatabase().rawQuery("SELECT COUNT(*) FROM gate_configs WHERE active=1", null);
-            int activeGates = 0; if (c2.moveToFirst()) activeGates = c2.getInt(0); c2.close();
-
-            gateStats.put("total", totalGates);
-            gateStats.put("active", activeGates);
-            result.put("gates", gateStats);
-
             // Check stats
             JSONObject checkStats = new JSONObject();
-            int totalChecks = stats.optInt("totalChecks", 0);
-            int liveCards = stats.optInt("liveCards", 0);
+            Cursor c3 = getReadableDatabase().rawQuery("SELECT COUNT(*) FROM check_results", null);
+            int totalChecks = 0; if (c3.moveToFirst()) totalChecks = c3.getInt(0); c3.close();
+            Cursor c4 = getReadableDatabase().rawQuery("SELECT COUNT(*) FROM check_results WHERE status='approved'", null);
+            int liveCards = 0; if (c4.moveToFirst()) liveCards = c4.getInt(0); c4.close();
+            int declined = getCheckResultCount("declined");
+            int errors = getCheckResultCount("error");
             checkStats.put("total", totalChecks);
             checkStats.put("approved", liveCards);
-            checkStats.put("declined", getCheckResultCount("declined"));
-            checkStats.put("errors", getCheckResultCount("error"));
+            checkStats.put("live", liveCards);
+            checkStats.put("declined", declined);
+            checkStats.put("errors", errors);
             result.put("checks", checkStats);
 
             // Proxy stats
             result.put("proxies", getProxyStats());
 
+            // Gates — array of gate objects with hasKey flag (what Dashboard expects)
+            JSONArray gatesArr = getGates();
+            result.put("gates", gatesArr);
+
             // Recent logs
             result.put("recentLogs", getLogs(20));
-
-            // Gate list with key info
-            JSONArray gatesArr = getGates();
-            JSONArray gatesList = new JSONArray();
-            for (int i = 0; i < gatesArr.length(); i++) {
-                JSONObject g = gatesArr.getJSONObject(i);
-                JSONObject gateInfo = new JSONObject();
-                gateInfo.put("id", g.getString("id"));
-                gateInfo.put("name", g.getString("name"));
-                gateInfo.put("gateType", g.getString("gateType"));
-                gateInfo.put("subType", g.getString("subType"));
-                gateInfo.put("active", g.getBoolean("active"));
-                JSONObject settings = g.optJSONObject("settings");
-                gateInfo.put("hasKey", settings != null && (settings.has("publicKey") || settings.has("btClientToken")));
-                gatesList.put(gateInfo);
-            }
-            result.put("gates", gateStats);
-            result.put("gateList", gatesList);
 
         } catch (JSONException e) { Log.e(TAG, "getDashboardStats", e); }
         return result;

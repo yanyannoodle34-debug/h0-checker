@@ -35,6 +35,7 @@ public class MainActivity extends Activity {
     private EmbeddedServer server;
     private static final int FILE_CHOOSER_REQUEST = 100;
     private ValueCallback<Uri[]> fileUploadCallback;
+    private boolean serverReady = false;
 
     @SuppressLint("SetJavaScriptEnabled")
     @Override
@@ -52,13 +53,10 @@ public class MainActivity extends Activity {
         webView = findViewById(R.id.webView);
         progressBar = findViewById(R.id.progressBar);
 
-        // Initialize database
         DatabaseHelper.getInstance(this);
 
-        // Start embedded server
         startServer();
 
-        // WebView settings
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
@@ -93,42 +91,14 @@ public class MainActivity extends Activity {
 
             @Override
             public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
+                Log.e(TAG, "WebView error: " + description + " URL: " + failingUrl);
                 Toast.makeText(MainActivity.this, "Error: " + description, Toast.LENGTH_SHORT).show();
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
-                // Auto-login: inject user into localStorage
-                view.evaluateJavascript(
-                    "(function() {" +
-                    "  try {" +
-                    "    var user = localStorage.getItem('h0_user');" +
-                    "    if (!user) {" +
-                    "      localStorage.setItem('h0_user', JSON.stringify({id:'admin-001',username:'admin',role:'admin'}));" +
-                    "      console.log('[H0] Auto-login: user set');" +
-                    "    }" +
-                    "  } catch(e) { console.log('[H0] Auto-login error:', e); }" +
-                    "})()", null
-                );
-            }
-        });
-
-        webView.setWebChromeClient(new WebChromeClient() {
-            @Override
-            public void onProgressChanged(WebView view, int newProgress) {
-                if (newProgress < 100) {
-                    progressBar.setVisibility(View.VISIBLE);
-                    progressBar.setProgress(newProgress);
-                } else {
-                    progressBar.setVisibility(View.GONE);
-                }
-            }
-
-            @Override
-            public boolean onConsoleMessage(ConsoleMessage msg) {
-                Log.d(TAG, "WebView: " + msg.message());
-                return true;
+                progressBar.setVisibility(View.GONE);
             }
 
             @Override
@@ -148,8 +118,53 @@ public class MainActivity extends Activity {
             }
         });
 
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onProgressChanged(WebView view, int newProgress) {
+                if (newProgress < 100) {
+                    progressBar.setVisibility(View.VISIBLE);
+                    progressBar.setProgress(newProgress);
+                } else {
+                    progressBar.setVisibility(View.GONE);
+                }
+            }
+
+            @Override
+            public boolean onConsoleMessage(ConsoleMessage msg) {
+                Log.d(TAG, "WebView: " + msg.message());
+                return true;
+            }
+        });
+
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+
+        // Pre-inject localStorage BEFORE loading the page so React sees it on first render
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                progressBar.setVisibility(View.GONE);
+                // Re-inject after every page load (SPA navigation, etc.)
+                injectAuth(view);
+            }
+        });
+
+        // Load the app
         webView.loadUrl(SERVER_URL);
+    }
+
+    private void injectAuth(WebView view) {
+        view.evaluateJavascript(
+            "(function() {" +
+            "  try {" +
+            "    var u = localStorage.getItem('h0_user');" +
+            "    if (!u) {" +
+            "      localStorage.setItem('h0_user', JSON.stringify({id:'admin-001',username:'admin',role:'admin'}));" +
+            "      console.log('[H0] Auth injected');" +
+            "    }" +
+            "  } catch(e) { console.log('[H0] Auth inject error:', e); }" +
+            "})()", null
+        );
     }
 
     private void startServer() {
@@ -157,7 +172,21 @@ public class MainActivity extends Activity {
             try {
                 server = new EmbeddedServer(this, SERVER_PORT);
                 server.startServer();
+                serverReady = true;
                 Log.i(TAG, "Server running on " + SERVER_URL);
+                runOnUiThread(() -> {
+                    // Pre-inject auth BEFORE loading page
+                    webView.evaluateJavascript(
+                        "(function() {" +
+                        "  try {" +
+                        "    var u = localStorage.getItem('h0_user');" +
+                        "    if (!u) {" +
+                        "      localStorage.setItem('h0_user', JSON.stringify({id:'admin-001',username:'admin',role:'admin'}));" +
+                        "    }" +
+                        "  } catch(e) {}" +
+                        "})()", null
+                    );
+                });
             } catch (IOException e) {
                 Log.e(TAG, "Server failed", e);
                 runOnUiThread(() ->
@@ -166,7 +195,7 @@ public class MainActivity extends Activity {
             }
         }).start();
 
-        try { Thread.sleep(800); } catch (InterruptedException ignored) {}
+        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
     }
 
     @Override
