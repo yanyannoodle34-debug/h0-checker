@@ -502,29 +502,64 @@ public class EmbeddedServer extends NanoHTTPD {
 
             if (cards == null || cards.length() == 0) return jsonError(400, "cards array required");
 
-            String gateName = "test";
-            if (gateOverride != null) gateName = gateOverride.optString("name", "test");
+            // Determine which gate to use
+            JSONObject gateConfig;
+            if (gateOverride != null) {
+                gateConfig = gateOverride;
+            } else {
+                // Use first active gate from DB
+                JSONArray gates = db.getGates();
+                gateConfig = null;
+                for (int i = 0; i < gates.length(); i++) {
+                    JSONObject g = gates.getJSONObject(i);
+                    if (g.optBoolean("active", false)) {
+                        gateConfig = g;
+                        break;
+                    }
+                }
+                if (gateConfig == null) {
+                    return jsonError(400, "No active gate configured. Add a gate first.");
+                }
+            }
 
+            String gateName = gateConfig.optString("name", "unknown");
             JSONArray results = new JSONArray();
+
             for (int i = 0; i < cards.length(); i++) {
-                String card = cards.optString(i, "");
+                String card = cards.optString(i, "").trim();
+                if (card.isEmpty()) continue;
+
                 String id = UUID.randomUUID().toString();
-                db.addCheckResult(id, maskCard(card), "error",
-                    "Test check — mobile app cannot reach external gate URLs. Configure gates on a server for live checks.",
-                    gateName, 0, "admin");
+                long start = System.currentTimeMillis();
+
+                // Run the actual check via GateChecker
+                GateChecker.CheckResult checkResult = GateChecker.checkCard(card, gateConfig);
+
+                // Store result in SQLite
+                db.addCheckResult(id, maskCard(card), checkResult.status,
+                    checkResult.response, gateName, checkResult.latency, "admin");
+
+                // Build response
                 JSONObject r = new JSONObject();
                 r.put("id", id);
                 r.put("card", maskCard(card));
-                r.put("status", "error");
-                r.put("response", "Test check — mobile app cannot reach external gate URLs");
+                r.put("status", checkResult.status);
+                r.put("response", checkResult.response);
                 r.put("gate", gateName);
-                r.put("latency", 0);
+                r.put("latency", checkResult.latency);
                 r.put("checkedBy", "admin");
-                r.put("createdAt", new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date()));
+                r.put("createdAt", new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").format(new java.util.Date()));
+                if (checkResult.rawSnippet != null) {
+                    r.put("rawSnippet", checkResult.rawSnippet);
+                }
                 results.put(r);
+
+                db.addLog("info", "Card checked: " + maskCard(card) + " → " + checkResult.status, "check");
             }
+
             return jsonResponse(results);
         } catch (Exception e) {
+            Log.e(TAG, "Run check error", e);
             return jsonError(500, e.getMessage());
         }
     }
