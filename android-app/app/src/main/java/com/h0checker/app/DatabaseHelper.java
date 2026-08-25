@@ -347,6 +347,140 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         return arr;
     }
 
+    // ── Gate Health ───────────────────────────────────────────────────────
+    public JSONObject getGateHealth(String gateId) {
+        JSONObject health = new JSONObject();
+        try {
+            JSONObject gate = getGate(gateId);
+            if (gate == null) {
+                health.put("checks10min", 0);
+                health.put("blocks", 0);
+                health.put("lastCheck", JSONObject.NULL);
+                health.put("url", JSONObject.NULL);
+                return health;
+            }
+
+            String gateName = gate.optString("name", "");
+            String url = gate.optString("url", "");
+
+            SQLiteDatabase db = getReadableDatabase();
+            // Count checks for this gate
+            Cursor c1 = db.rawQuery("SELECT COUNT(*) FROM check_results WHERE gate=?", new String[]{gateName});
+            int totalChecks = 0;
+            if (c1.moveToFirst()) totalChecks = c1.getInt(0);
+            c1.close();
+
+            // Count errors (blocks)
+            Cursor c2 = db.rawQuery("SELECT COUNT(*) FROM check_results WHERE gate=? AND status='error'", new String[]{gateName});
+            int blocks = 0;
+            if (c2.moveToFirst()) blocks = c2.getInt(0);
+            c2.close();
+
+            // Last check time
+            Cursor c3 = db.rawQuery("SELECT created_at FROM check_results WHERE gate=? ORDER BY created_at DESC LIMIT 1", new String[]{gateName});
+            String lastCheck = null;
+            if (c3.moveToFirst()) lastCheck = c3.getString(0);
+            c3.close();
+
+            health.put("checks10min", totalChecks);
+            health.put("blocks", blocks);
+            health.put("lastCheck", lastCheck != null ? lastCheck : JSONObject.NULL);
+            health.put("url", url);
+        } catch (JSONException e) {
+            Log.e(TAG, "getGateHealth error", e);
+        }
+        return health;
+    }
+
+    // ── Failure Suggestions ──────────────────────────────────────────────
+    public JSONObject getFailureSuggestions(String gateId) {
+        JSONObject result = new JSONObject();
+        try {
+            JSONObject gate = getGate(gateId);
+            if (gate == null) {
+                result.put("sampleSize", 0);
+                result.put("suggestions", new JSONArray());
+                return result;
+            }
+
+            String gateName = gate.optString("name", "");
+            SQLiteDatabase db = getReadableDatabase();
+
+            // Get last 200 results for this gate
+            Cursor c = db.rawQuery(
+                "SELECT status, response FROM check_results WHERE gate=? ORDER BY created_at DESC LIMIT 200",
+                new String[]{gateName});
+
+            int total = 0, approved = 0, declined = 0, errors = 0;
+            int captchaCount = 0, nonceCount = 0, rateLimited = 0, proxyErr = 0;
+
+            while (c.moveToNext()) {
+                total++;
+                String status = c.getString(0);
+                String response = c.getString(1);
+                if ("approved".equals(status)) approved++;
+                else if ("declined".equals(status)) declined++;
+                else if ("error".equals(status)) errors++;
+
+                if (response != null) {
+                    String lower = response.toLowerCase();
+                    if (lower.contains("captcha")) captchaCount++;
+                    if (lower.contains("nonce") || lower.contains("session expired")) nonceCount++;
+                    if (lower.contains("rate") || lower.contains("too many requests") || lower.contains("429")) rateLimited++;
+                    if (lower.contains("proxy") || lower.contains("econnrefused") || lower.contains("timeout")) proxyErr++;
+                }
+            }
+            c.close();
+
+            JSONObject stats = new JSONObject();
+            stats.put("approved", approved);
+            stats.put("declined", declined);
+            stats.put("errors", errors);
+            stats.put("captchaCount", captchaCount);
+            stats.put("nonceCount", nonceCount);
+            stats.put("rateLimited", rateLimited);
+            stats.put("proxyErr", proxyErr);
+
+            JSONArray suggestions = new JSONArray();
+
+            if (captchaCount >= 3) {
+                JSONObject s = new JSONObject();
+                s.put("reason", captchaCount + "/" + total + " responses mention captcha");
+                s.put("settings", new JSONObject().put("captchaProvider", "2captcha"));
+                s.put("confidence", 0.85);
+                suggestions.put(s);
+            }
+            if (nonceCount >= 5) {
+                JSONObject s = new JSONObject();
+                s.put("reason", nonceCount + "/" + total + " nonce/session errors — try Block Checkout flow");
+                s.put("settings", new JSONObject().put("wcBlockCheckout", true));
+                s.put("confidence", 0.80);
+                suggestions.put(s);
+            }
+            if (rateLimited >= 3) {
+                JSONObject s = new JSONObject();
+                s.put("reason", rateLimited + "/" + total + " rate-limit responses — add proxy rotation");
+                s.put("settings", new JSONObject().put("useProxies", true));
+                s.put("confidence", 0.75);
+                suggestions.put(s);
+            }
+            if (proxyErr >= 3) {
+                JSONObject s = new JSONObject();
+                s.put("reason", proxyErr + "/" + total + " proxy errors — check proxy config");
+                s.put("settings", new JSONObject().put("proxyRetries", 3));
+                s.put("confidence", 0.70);
+                suggestions.put(s);
+            }
+
+            result.put("sampleSize", total);
+            result.put("stats", stats);
+            result.put("suggestions", suggestions);
+        } catch (JSONException e) {
+            Log.e(TAG, "getFailureSuggestions error", e);
+        }
+        return result;
+    }
+
     // ── Stats ─────────────────────────────────────────────────────────────
     public JSONObject getStats() {
         SQLiteDatabase db = getReadableDatabase();

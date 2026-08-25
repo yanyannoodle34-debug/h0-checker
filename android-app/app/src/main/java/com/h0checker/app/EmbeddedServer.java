@@ -12,7 +12,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Map;
+import java.util.UUID;
 
 import fi.iki.elonen.NanoHTTPD;
 
@@ -55,132 +57,170 @@ public class EmbeddedServer extends NanoHTTPD {
         String uri = session.getUri();
         String method = session.getMethod().name();
 
-        // ── API Routes ────────────────────────────────────────────────
-        if (uri.startsWith("/api/")) {
-            return handleApi(session, uri, method);
+        if (method.equals("OPTIONS")) {
+            Response r = newFixedLengthResponse(Response.Status.OK, "text/plain", "");
+            addCorsHeaders(r);
+            return r;
         }
 
-        // ── Static Files ──────────────────────────────────────────────
-        return serveStatic(uri);
+        if (uri.startsWith("/api/")) {
+            Response r = handleApi(session, uri, method);
+            addCorsHeaders(r);
+            return r;
+        }
+
+        Response r = serveStatic(uri);
+        addCorsHeaders(r);
+        return r;
+    }
+
+    private void addCorsHeaders(Response r) {
+        r.addHeader("Access-Control-Allow-Origin", "*");
+        r.addHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+        r.addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  API HANDLER
+    //  API ROUTER
     // ══════════════════════════════════════════════════════════════════
     private Response handleApi(IHTTPSession session, String uri, String method) {
         try {
-            // POST /api/auth/login
-            if (uri.equals("/api/auth/login") && method.equals("POST")) {
+            // ── Auth ──────────────────────────────────────────────
+            if (uri.equals("/api/auth/login") && method.equals("POST"))
                 return handleLogin(session);
-            }
-
-            // GET /api/auth/me
-            if (uri.equals("/api/auth/me") && method.equals("GET")) {
+            if (uri.equals("/api/auth/me") && method.equals("GET"))
                 return jsonResponse(db.login("admin", "926696"));
-            }
 
-            // GET /api/gates
-            if (uri.equals("/api/gates") && method.equals("GET")) {
+            // ── Gate CRUD ────────────────────────────────────────
+            if (uri.equals("/api/gates") && method.equals("GET"))
                 return jsonResponse(db.getGates());
-            }
-
-            // POST /api/gates
-            if (uri.equals("/api/gates") && method.equals("POST")) {
+            if (uri.equals("/api/gates") && method.equals("POST"))
                 return handleCreateGate(session);
-            }
 
-            // PUT /api/gates/:id
-            if (uri.matches("/api/gates/[a-f0-9-]+") && method.equals("PUT")) {
-                return handleUpdateGate(session, uri);
-            }
-
+            // PATCH /api/gates/:id  (frontend uses PATCH)
+            if (uri.matches("/api/gates/[a-f0-9-]+") && method.equals("PATCH"))
+                return handlePatchGate(session, uri);
+            // PUT /api/gates/:id  (also accept PUT for compat)
+            if (uri.matches("/api/gates/[a-f0-9-]+") && method.equals("PUT"))
+                return handlePatchGate(session, uri);
             // DELETE /api/gates/:id
             if (uri.matches("/api/gates/[a-f0-9-]+") && method.equals("DELETE")) {
-                String id = uri.split("/")[3];
+                String id = extractId(uri);
                 db.deleteGate(id);
+                db.addLog("info", "Gate deleted: " + id, "gate");
                 return jsonResponse(new JSONObject().put("success", true));
             }
 
-            // GET /api/check-results
-            if (uri.equals("/api/check-results") && method.equals("GET")) {
+            // ── Gate Types ────────────────────────────────────────
+            if (uri.equals("/api/gates/types") && method.equals("GET"))
+                return handleGateTypes();
+
+            // ── Gate Health ───────────────────────────────────────
+            if (uri.matches("/api/gates/[a-f0-9-]+/health") && method.equals("GET"))
+                return handleGateHealth(session, uri);
+
+            // ── Gate Failure Suggestions ──────────────────────────
+            if (uri.matches("/api/gates/[a-f0-9-]+/failure-suggestions") && method.equals("GET"))
+                return handleFailureSuggestions(session, uri);
+
+            // ── Gate Detect / Scrape / Auto-setup ─────────────────
+            if (uri.equals("/api/gates/detect-url") && method.equals("POST"))
+                return handleDetectUrl(session);
+            if (uri.equals("/api/gates/auto-setup") && method.equals("POST"))
+                return handleAutoSetup(session);
+            if (uri.equals("/api/gates/scrape-hints") && method.equals("POST"))
+                return handleScrapeHints(session);
+
+            // ── Gate Import ───────────────────────────────────────
+            if (uri.equals("/api/gates/import") && method.equals("POST"))
+                return handleGateImport(session);
+
+            // ── Gate Bulk Setup (stub — SSE not feasible on mobile) ─
+            if (uri.equals("/api/gates/bulk-setup") && method.equals("POST"))
+                return jsonResponse(new JSONObject()
+                    .put("error", "Bulk setup requires server-side crawling (unavailable on mobile)")
+                    .put("status", "unsupported"));
+
+            // ── Check Results ─────────────────────────────────────
+            if (uri.equals("/api/check-results") && method.equals("GET"))
                 return jsonResponse(db.getCheckResults());
-            }
+            if (uri.equals("/api/checks") && method.equals("POST"))
+                return handleRunCheck(session);
 
-            // GET /api/proxies
-            if (uri.equals("/api/proxies") && method.equals("GET")) {
+            // ── Proxies ───────────────────────────────────────────
+            if (uri.equals("/api/proxies") && method.equals("GET"))
                 return jsonResponse(db.getProxies());
-            }
 
-            // GET /api/keys
-            if (uri.equals("/api/keys") && method.equals("GET")) {
+            // ── Keys ──────────────────────────────────────────────
+            if (uri.equals("/api/keys") && method.equals("GET"))
                 return jsonResponse(db.getKeys());
-            }
 
-            // GET /api/bot-settings
-            if (uri.equals("/api/bot-settings") && method.equals("GET")) {
+            // ── Bot Settings ──────────────────────────────────────
+            if (uri.equals("/api/bot-settings") && method.equals("GET"))
                 return jsonResponse(db.getBotSettings());
-            }
-
-            // PUT /api/bot-settings
-            if (uri.equals("/api/bot-settings") && method.equals("PUT")) {
+            if (uri.equals("/api/bot-settings") && method.equals("PUT"))
                 return handleUpdateBotSettings(session);
-            }
 
-            // GET /api/system/stats
-            if (uri.equals("/api/system/stats") && method.equals("GET")) {
-                return jsonResponse(db.getStats());
-            }
-
-            // GET /api/system/logs
-            if (uri.equals("/api/system/logs") && method.equals("GET")) {
-                return jsonResponse(db.getLogs());
-            }
-
-            // GET /api/settings
-            if (uri.equals("/api/settings") && method.equals("GET")) {
+            // ── Settings (alias for bot-settings) ─────────────────
+            if (uri.equals("/api/settings") && method.equals("GET"))
                 return jsonResponse(db.getBotSettings());
-            }
-
-            // PUT /api/settings
-            if (uri.equals("/api/settings") && method.equals("PUT")) {
+            if (uri.equals("/api/settings") && method.equals("PUT"))
                 return handleUpdateBotSettings(session);
-            }
 
-            // GET /api/miner/config
-            if (uri.equals("/api/miner/config") && method.equals("GET")) {
-                return jsonResponse(new JSONObject().put("isRunning", false));
-            }
-
-            // GET /api/proxy-config
-            if (uri.equals("/api/proxy-config") && method.equals("GET")) {
-                return jsonResponse(new JSONObject().put("enabled", true));
-            }
-
-            // GET /api/session
-            if (uri.equals("/api/session") && method.equals("GET")) {
-                JSONObject sessionData = new JSONObject();
-                sessionData.put("sessions", new JSONArray());
-                sessionData.put("cooldowns", new JSONArray());
-                return jsonResponse(sessionData);
-            }
-
-            // Bot start/stop stubs
+            // ── Bot Start / Stop ──────────────────────────────────
             if (uri.equals("/api/bot/start") && method.equals("POST")) {
                 db.updateBotSettings(new JSONObject().put("botRunning", true));
-                return jsonResponse(new JSONObject().put("success", true));
+                db.addLog("info", "Bot started", "bot");
+                return jsonResponse(new JSONObject()
+                    .put("success", true)
+                    .put("message", "Bot started (stub)"));
             }
             if (uri.equals("/api/bot/stop") && method.equals("POST")) {
                 db.updateBotSettings(new JSONObject().put("botRunning", false));
-                return jsonResponse(new JSONObject().put("success", true));
+                db.addLog("info", "Bot stopped", "bot");
+                return jsonResponse(new JSONObject()
+                    .put("success", true)
+                    .put("message", "Bot stopped"));
             }
 
-            // Clear session
-            if (uri.equals("/api/session/clear") && method.equals("POST")) {
-                return jsonResponse(new JSONObject().put("success", true));
-            }
+            // ── Sessions (plural — what frontend uses) ────────────
+            if (uri.equals("/api/sessions") && method.equals("GET"))
+                return jsonResponse(new JSONObject().put("sessions", new JSONArray()).put("cooldowns", new JSONArray()));
+            if (uri.equals("/api/sessions") && method.equals("DELETE"))
+                return jsonResponse(new JSONObject().put("cleared", 0));
+            if (uri.matches("/api/sessions/[a-zA-Z0-9.-]+") && method.equals("DELETE"))
+                return jsonResponse(new JSONObject().put("ok", true));
 
-            // Fallback for unknown API routes
+            // ── Session (singular — legacy) ───────────────────────
+            if (uri.equals("/api/session") && method.equals("GET"))
+                return jsonResponse(new JSONObject().put("sessions", new JSONArray()).put("cooldowns", new JSONArray()));
+            if (uri.equals("/api/session/clear") && method.equals("POST"))
+                return jsonResponse(new JSONObject().put("success", true));
+
+            // ── System ────────────────────────────────────────────
+            if (uri.equals("/api/system/stats") && method.equals("GET"))
+                return jsonResponse(db.getStats());
+            if (uri.equals("/api/system/logs") && method.equals("GET"))
+                return jsonResponse(db.getLogs());
+
+            // ── Miner / Proxy Config (stubs) ──────────────────────
+            if (uri.equals("/api/miner/config") && method.equals("GET"))
+                return jsonResponse(new JSONObject().put("isRunning", false));
+            if (uri.equals("/api/proxy-config") && method.equals("GET"))
+                return jsonResponse(new JSONObject().put("enabled", true));
+
+            // ── AI stubs ──────────────────────────────────────────
+            if (uri.equals("/api/ai/gate-suggest") && method.equals("POST"))
+                return handleAiGateSuggest(session);
+            if (uri.equals("/api/ai/configure-gates") && method.equals("POST"))
+                return jsonResponse(new JSONObject().put("error", "AI requires external API (unavailable on mobile)"));
+            if (uri.equals("/api/ai/collect-and-configure") && method.equals("POST"))
+                return jsonResponse(new JSONObject().put("error", "AI requires external API (unavailable on mobile)"));
+
+            // ── Fallback ──────────────────────────────────────────
+            Log.w(TAG, "Unmatched API: " + method + " " + uri);
             return jsonResponse(new JSONObject());
+
         } catch (Exception e) {
             Log.e(TAG, "API error: " + uri, e);
             return jsonError(500, e.getMessage());
@@ -188,14 +228,14 @@ public class EmbeddedServer extends NanoHTTPD {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  API HANDLERS
+    //  HANDLERS
     // ══════════════════════════════════════════════════════════════════
+
     private Response handleLogin(IHTTPSession session) {
         try {
             JSONObject body = readBody(session);
             String username = body.optString("username", "admin");
             String password = body.optString("password", "");
-
             JSONObject user = db.login(username, password);
             if (user != null) {
                 db.addLog("info", "Login successful: " + username, "auth");
@@ -210,39 +250,306 @@ public class EmbeddedServer extends NanoHTTPD {
     private Response handleCreateGate(IHTTPSession session) {
         try {
             JSONObject body = readBody(session);
-            String id = java.util.UUID.randomUUID().toString();
-            JSONObject gate = db.createGate(
-                id,
-                body.optString("name", "Unnamed"),
-                body.optString("gateType", ""),
-                body.optString("subType", "standard"),
-                body.optString("url", ""),
-                body.optBoolean("active", true),
-                body.optString("country", ""),
-                body.optJSONObject("settings") != null ? body.optJSONObject("settings").toString() : "{}"
-            );
-            db.addLog("info", "Gate created: " + body.optString("name"), "gate");
+            String id = UUID.randomUUID().toString();
+            String name = body.optString("name", "Unnamed");
+            String gateType = body.optString("gateType", "");
+            String subType = body.optString("subType", "standard");
+            String url = body.optString("url", "");
+            boolean active = body.optBoolean("active", true);
+            String country = body.optString("country", "");
+            JSONObject settings = body.optJSONObject("settings");
+            if (settings == null) settings = new JSONObject();
+            if (!settings.has("siteUrl")) settings.put("siteUrl", url);
+
+            JSONObject gate = db.createGate(id, name, gateType, subType, url, active, country, settings.toString());
+            db.addLog("info", "Gate created: " + name + " (" + gateType + ")", "gate");
             return jsonResponse(gate);
         } catch (Exception e) {
             return jsonError(500, e.getMessage());
         }
     }
 
-    private Response handleUpdateGate(IHTTPSession session, String uri) {
+    private Response handlePatchGate(IHTTPSession session, String uri) {
         try {
-            String id = uri.split("/")[3];
+            String id = extractId(uri);
             JSONObject body = readBody(session);
-            db.updateGate(
-                id,
-                body.optString("name", ""),
-                body.optString("gateType", ""),
-                body.optString("subType", ""),
-                body.optString("url", ""),
-                body.optBoolean("active", true),
-                body.optString("country", ""),
-                body.optJSONObject("settings") != null ? body.optJSONObject("settings").toString() : "{}"
-            );
+            JSONObject current = db.getGate(id);
+            if (current == null) return jsonError(404, "Gate not found");
+
+            String name = body.has("name") ? body.getString("name") : current.optString("name", "");
+            String gateType = body.has("gateType") ? body.getString("gateType") : current.optString("gateType", "");
+            String subType = body.has("subType") ? body.getString("subType") : current.optString("subType", "standard");
+            String url = body.has("url") ? body.getString("url") : current.optString("url", "");
+            boolean active = body.has("active") ? body.getBoolean("active") : current.optBoolean("active", true);
+            String country = body.has("country") ? body.getString("country") : current.optString("country", "");
+
+            JSONObject currentSettings = current.optJSONObject("settings");
+            JSONObject bodySettings = body.optJSONObject("settings");
+            JSONObject mergedSettings = new JSONObject();
+            if (currentSettings != null) {
+                for (Iterator<String> it = currentSettings.keys(); it.hasNext(); ) {
+                    String k = it.next();
+                    mergedSettings.put(k, currentSettings.get(k));
+                }
+            }
+            if (bodySettings != null) {
+                for (Iterator<String> it = bodySettings.keys(); it.hasNext(); ) {
+                    String k = it.next();
+                    mergedSettings.put(k, bodySettings.get(k));
+                }
+            }
+            if (url != null && !url.isEmpty() && !mergedSettings.has("siteUrl")) {
+                mergedSettings.put("siteUrl", url);
+            }
+
+            db.updateGate(id, name, gateType, subType, url, active, country, mergedSettings.toString());
+            db.addLog("info", "Gate updated: " + name, "gate");
             return jsonResponse(db.getGate(id));
+        } catch (Exception e) {
+            return jsonError(500, e.getMessage());
+        }
+    }
+
+    private Response handleGateTypes() {
+        try {
+            JSONArray types = new JSONArray();
+
+            JSONObject stripe = new JSONObject();
+            stripe.put("id", "stripe");
+            stripe.put("name", "Stripe");
+            stripe.put("subtypes", new JSONArray()
+                .put("auth").put("charges").put("charitable").put("givewp").put("givewp_v3")
+                .put("gravityforms").put("wp_full_stripe").put("payment_intents")
+                .put("tokenize").put("standard").put("3d_secure").put("checkout_session")
+                .put("wc_stripe_confirm_setup_intent").put("stripe_page_confirm"));
+            types.put(stripe);
+
+            JSONObject shopify = new JSONObject();
+            shopify.put("id", "shopify");
+            shopify.put("name", "Shopify");
+            shopify.put("subtypes", new JSONArray().put("pci").put("standard"));
+            types.put(shopify);
+
+            JSONObject braintree = new JSONObject();
+            braintree.put("id", "braintree");
+            braintree.put("name", "Braintree");
+            braintree.put("subtypes", new JSONArray()
+                .put("standard").put("graphql").put("drop_in").put("hosted_fields").put("bigcommerce_stencil"));
+            types.put(braintree);
+
+            JSONObject payeezy = new JSONObject();
+            payeezy.put("id", "payeezy");
+            payeezy.put("name", "First Data Payeezy");
+            payeezy.put("subtypes", new JSONArray().put("standard"));
+            types.put(payeezy);
+
+            JSONObject paypal = new JSONObject();
+            paypal.put("id", "paypal");
+            paypal.put("name", "PayPal");
+            paypal.put("subtypes", new JSONArray()
+                .put("standard").put("express").put("advanced")
+                .put("givewp_commerce").put("paypal_commerce"));
+            types.put(paypal);
+
+            JSONObject adyen = new JSONObject();
+            adyen.put("id", "adyen");
+            adyen.put("name", "Adyen");
+            adyen.put("subtypes", new JSONArray().put("standard").put("drop_in").put("components"));
+            types.put(adyen);
+
+            return jsonResponse(types);
+        } catch (Exception e) {
+            return jsonError(500, e.getMessage());
+        }
+    }
+
+    private Response handleGateHealth(IHTTPSession session, String uri) {
+        try {
+            String id = extractId(uri);
+            JSONObject health = db.getGateHealth(id);
+            return jsonResponse(health);
+        } catch (Exception e) {
+            return jsonError(500, e.getMessage());
+        }
+    }
+
+    private Response handleFailureSuggestions(IHTTPSession session, String uri) {
+        try {
+            String id = extractId(uri);
+            JSONObject result = db.getFailureSuggestions(id);
+            return jsonResponse(result);
+        } catch (Exception e) {
+            return jsonError(500, e.getMessage());
+        }
+    }
+
+    private Response handleDetectUrl(IHTTPSession session) {
+        try {
+            JSONObject body = readBody(session);
+            String url = body.optString("url", "");
+            if (url.isEmpty()) return jsonError(400, "URL required");
+
+            db.addLog("info", "Auto-detect requested (stub): " + url, "gate-detector");
+            JSONObject result = new JSONObject();
+            result.put("gateType", "unknown");
+            result.put("subType", "standard");
+            result.put("confidence", 0);
+            result.put("siteUrl", url);
+            result.put("crawledPaths", new JSONArray());
+            result.put("signals", new JSONArray().put("Detection requires server-side crawling (unavailable on mobile)"));
+            result.put("settings", new JSONObject());
+            return jsonResponse(result);
+        } catch (Exception e) {
+            return jsonError(500, e.getMessage());
+        }
+    }
+
+    private Response handleAutoSetup(IHTTPSession session) {
+        try {
+            JSONObject body = readBody(session);
+            String url = body.optString("url", "");
+            if (url.isEmpty()) return jsonError(400, "URL required");
+
+            String id = UUID.randomUUID().toString();
+            String name = url.replace("https://", "").replace("http://", "").split("/")[0];
+            JSONObject settings = new JSONObject();
+            settings.put("siteUrl", url);
+            settings.put("autoDetected", false);
+
+            JSONObject gate = db.createGate(id, name, "unknown", "standard", url, true, "", settings.toString());
+            db.addLog("info", "Auto-setup gate created: " + name, "gate");
+
+            JSONObject result = new JSONObject();
+            result.put("gate", gate);
+            JSONObject detection = new JSONObject();
+            detection.put("gateType", "unknown");
+            detection.put("subType", "standard");
+            detection.put("confidence", 0);
+            detection.put("siteUrl", url);
+            detection.put("crawledPaths", new JSONArray());
+            detection.put("signals", new JSONArray().put("Created manually — detection requires server-side crawling"));
+            detection.put("settings", settings);
+            result.put("detection", detection);
+            return jsonResponse(result);
+        } catch (Exception e) {
+            return jsonError(500, e.getMessage());
+        }
+    }
+
+    private Response handleScrapeHints(IHTTPSession session) {
+        try {
+            JSONObject body = readBody(session);
+            String url = body.optString("url", "");
+            if (url.isEmpty()) return jsonError(400, "url required");
+
+            JSONObject result = new JSONObject();
+            result.put("ok", false);
+            result.put("status", 0);
+            result.put("error", "Scraping requires server-side HTTP client (unavailable on mobile)");
+            result.put("hints", new JSONObject());
+            return jsonResponse(result);
+        } catch (Exception e) {
+            return jsonError(500, e.getMessage());
+        }
+    }
+
+    private Response handleGateImport(IHTTPSession session) {
+        try {
+            JSONObject body = readBody(session);
+            JSONArray gatesArray = body.optJSONArray("gates");
+            if (gatesArray == null) return jsonError(400, "gates array required");
+
+            JSONArray created = new JSONArray();
+            int skipped = 0;
+            for (int i = 0; i < gatesArray.length(); i++) {
+                try {
+                    JSONObject g = gatesArray.getJSONObject(i);
+                    String name = g.optString("name", "");
+                    String gateType = g.optString("gateType", "");
+                    String subType = g.optString("subType", "standard");
+                    String url = g.optString("url", "");
+                    if (name.isEmpty() || gateType.isEmpty()) { skipped++; continue; }
+
+                    String gateId = UUID.randomUUID().toString();
+                    boolean active = g.optBoolean("active", true);
+                    JSONObject settings = g.optJSONObject("settings");
+                    if (settings == null) settings = new JSONObject();
+                    if (!settings.has("siteUrl")) settings.put("siteUrl", url);
+
+                    JSONObject gate = db.createGate(gateId, name, gateType, subType, url, active, "", settings.toString());
+                    created.put(gate);
+                } catch (Exception e) {
+                    skipped++;
+                }
+            }
+
+            db.addLog("info", "Bulk import: " + created.length() + " created, " + skipped + " skipped", "gate");
+            JSONObject result = new JSONObject();
+            result.put("imported", created.length());
+            result.put("skipped", skipped);
+            result.put("gates", created);
+            return jsonResponse(result);
+        } catch (Exception e) {
+            return jsonError(500, e.getMessage());
+        }
+    }
+
+    private Response handleRunCheck(IHTTPSession session) {
+        try {
+            JSONObject body = readBody(session);
+            JSONArray cards = body.optJSONArray("cards");
+            JSONObject gateOverride = body.optJSONObject("gateOverride");
+
+            if (cards == null || cards.length() == 0) return jsonError(400, "cards array required");
+
+            String gateName = "test";
+            if (gateOverride != null) gateName = gateOverride.optString("name", "test");
+
+            JSONArray results = new JSONArray();
+            for (int i = 0; i < cards.length(); i++) {
+                String card = cards.optString(i, "");
+                String id = UUID.randomUUID().toString();
+                db.addCheckResult(id, maskCard(card), "error",
+                    "Test check — mobile app cannot reach external gate URLs. Configure gates on a server for live checks.",
+                    gateName, 0, "admin");
+                JSONObject r = new JSONObject();
+                r.put("id", id);
+                r.put("card", maskCard(card));
+                r.put("status", "error");
+                r.put("response", "Test check — mobile app cannot reach external gate URLs");
+                r.put("gate", gateName);
+                r.put("latency", 0);
+                r.put("checkedBy", "admin");
+                r.put("createdAt", new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date()));
+                results.put(r);
+            }
+            return jsonResponse(results);
+        } catch (Exception e) {
+            return jsonError(500, e.getMessage());
+        }
+    }
+
+    private Response handleAiGateSuggest(IHTTPSession session) {
+        try {
+            JSONObject body = readBody(session);
+            String gateType = body.optString("gateType", "unknown");
+            String subType = body.optString("subType", "standard");
+            String url = body.optString("url", "");
+            JSONObject settings = body.optJSONObject("settings");
+            if (settings == null) settings = new JSONObject();
+
+            JSONObject result = new JSONObject();
+            JSONObject detection = new JSONObject();
+            detection.put("gateType", gateType);
+            detection.put("subType", subType);
+            detection.put("confidence", 0.5);
+            detection.put("publicKey", settings.optString("publicKey", ""));
+            detection.put("signals", new JSONArray().put("AI analysis requires external API (unavailable on mobile)"));
+            result.put("detection", detection);
+            result.put("analysis", "AI gate suggestion requires an external LLM API. Configure the gate settings manually.");
+            result.put("suggestions", new JSONArray());
+            result.put("polishedSettings", settings);
+            return jsonResponse(result);
         } catch (Exception e) {
             return jsonError(500, e.getMessage());
         }
@@ -262,36 +569,26 @@ public class EmbeddedServer extends NanoHTTPD {
     //  STATIC FILE SERVER
     // ══════════════════════════════════════════════════════════════════
     private Response serveStatic(String uri) {
-        if (uri.equals("/") || uri.equals("")) {
-            uri = "/index.html";
-        }
+        if (uri.equals("/") || uri.isEmpty()) uri = "/index.html";
 
         String assetPath = uri.startsWith("/") ? uri.substring(1) : uri;
+        if (assetPath.contains("?")) assetPath = assetPath.split("\\?")[0];
 
-        // Remove query string
-        if (assetPath.contains("?")) {
-            assetPath = assetPath.split("\\?")[0];
-        }
-
-        // Try exact path
         try {
             InputStream is = assetManager.open(assetPath);
             return serveAsset(is, assetPath);
         } catch (IOException ignored) {}
 
-        // Try .html extension
         try {
             InputStream is = assetManager.open(assetPath + ".html");
             return serveAsset(is, assetPath + ".html");
         } catch (IOException ignored) {}
 
-        // Try index.html in directory
         try {
             InputStream is = assetManager.open(assetPath + "/index.html");
             return serveAsset(is, assetPath + "/index.html");
         } catch (IOException ignored) {}
 
-        // SPA fallback
         try {
             InputStream is = assetManager.open("index.html");
             return serveAsset(is, "index.html");
@@ -319,7 +616,6 @@ public class EmbeddedServer extends NanoHTTPD {
         } else {
             response.addHeader("Cache-Control", "no-cache");
         }
-
         return response;
     }
 
@@ -328,13 +624,20 @@ public class EmbeddedServer extends NanoHTTPD {
     // ══════════════════════════════════════════════════════════════════
     private JSONObject readBody(IHTTPSession session) throws IOException, JSONException {
         Map<String, String> bodyMap = new HashMap<>();
-        try {
-            session.parseBody(bodyMap);
-        } catch (Exception ignored) {}
-
+        try { session.parseBody(bodyMap); } catch (Exception ignored) {}
         String bodyStr = bodyMap.get("postData");
         if (bodyStr == null) bodyStr = "";
         return new JSONObject(bodyStr);
+    }
+
+    private String extractId(String uri) {
+        String[] parts = uri.split("/");
+        return parts[parts.length - 1];
+    }
+
+    private String maskCard(String card) {
+        if (card == null || card.length() < 13) return card;
+        return card.substring(0, 6) + "******" + card.substring(card.length() - 4);
     }
 
     private Response jsonResponse(Object obj) {
@@ -345,12 +648,15 @@ public class EmbeddedServer extends NanoHTTPD {
     private Response jsonError(int code, String message) {
         try {
             JSONObject err = new JSONObject();
+            err.put("message", message);
             err.put("error", message);
-            Response.Status status = Response.Status.INTERNAL_ERROR;
-            if (code == 401) status = Response.Status.UNAUTHORIZED;
-            else if (code == 404) status = Response.Status.NOT_FOUND;
-            else if (code == 400) status = Response.Status.BAD_REQUEST;
-            else if (code == 500) status = Response.Status.INTERNAL_ERROR;
+            Response.Status status;
+            switch (code) {
+                case 400: status = Response.Status.BAD_REQUEST; break;
+                case 401: status = Response.Status.UNAUTHORIZED; break;
+                case 404: status = Response.Status.NOT_FOUND; break;
+                default: status = Response.Status.INTERNAL_ERROR; break;
+            }
             return newFixedLengthResponse(status, "application/json", err.toString());
         } catch (Exception e) {
             return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", message);
