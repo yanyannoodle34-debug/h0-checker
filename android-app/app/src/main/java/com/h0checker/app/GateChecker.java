@@ -481,6 +481,35 @@ public class GateChecker {
         catch (Exception e) { return s; }
     }
 
+    private static String guessCardType(String num) {
+        if (num == null) return "Unknown";
+        String n = num.replaceAll("[^0-9]", "");
+        if (n.startsWith("4")) return "VISA";
+        if (n.length() >= 2) {
+            int prefix = Integer.parseInt(n.substring(0, 2));
+            if (prefix >= 51 && prefix <= 55) return "MASTERCARD";
+        }
+        if (n.length() >= 4) {
+            int prefix4 = Integer.parseInt(n.substring(0, 4));
+            if (prefix4 >= 2221 && prefix4 <= 2720) return "MASTERCARD";
+            if (prefix4 >= 3528 && prefix4 <= 3589) return "JCB";
+        }
+        if (n.length() >= 3) {
+            int prefix3 = Integer.parseInt(n.substring(0, 3));
+            if (prefix3 >= 300 && prefix3 <= 305) return "DINERS";
+            if (prefix3 == 309 || prefix3 == 36 || prefix3 == 38 || prefix3 == 39) return "DINERS";
+        }
+        if (n.length() >= 4) {
+            int prefix4 = Integer.parseInt(n.substring(0, 4));
+            if (prefix4 >= 3400 && prefix4 <= 3499) return "AMEX";
+            if (prefix4 >= 3700 && prefix4 <= 3799) return "AMEX";
+            if (prefix4 >= 4000 && prefix4 <= 4999) return "VISA";
+        }
+        if (n.startsWith("6011") || n.startsWith("65")) return "DISCOVER";
+        if (n.length() >= 4 && Integer.parseInt(n.substring(0, 4)) >= 6440 && Integer.parseInt(n.substring(0, 4)) <= 6599) return "DISCOVER";
+        return "UNKNOWN";
+    }
+
     // ══════════════════════════════════════════════════════════════════
     //  RESULT TYPES
     // ══════════════════════════════════════════════════════════════════

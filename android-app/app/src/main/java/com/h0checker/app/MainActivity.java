@@ -99,22 +99,7 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 progressBar.setVisibility(View.GONE);
-            }
-
-            @Override
-            public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams fileChooserParams) {
-                if (fileUploadCallback != null) {
-                    fileUploadCallback.onReceiveValue(null);
-                }
-                fileUploadCallback = filePathCallback;
-                Intent intent = fileChooserParams.createIntent();
-                try {
-                    startActivityForResult(intent, FILE_CHOOSER_REQUEST);
-                } catch (Exception e) {
-                    fileUploadCallback = null;
-                    return false;
-                }
-                return true;
+                injectAuth(view);
             }
         });
 
@@ -134,20 +119,25 @@ public class MainActivity extends Activity {
                 Log.d(TAG, "WebView: " + msg.message());
                 return true;
             }
+
+            @Override
+            public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams fileChooserParams) {
+                if (fileUploadCallback != null) {
+                    fileUploadCallback.onReceiveValue(null);
+                }
+                fileUploadCallback = filePathCallback;
+                Intent intent = fileChooserParams.createIntent();
+                try {
+                    startActivityForResult(intent, FILE_CHOOSER_REQUEST);
+                } catch (Exception e) {
+                    fileUploadCallback = null;
+                    return false;
+                }
+                return true;
+            }
         });
 
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
-
-        // Pre-inject localStorage BEFORE loading the page so React sees it on first render
-        webView.setWebViewClient(new WebViewClient() {
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                super.onPageFinished(view, url);
-                progressBar.setVisibility(View.GONE);
-                // Re-inject after every page load (SPA navigation, etc.)
-                injectAuth(view);
-            }
-        });
 
         // Load the app
         webView.loadUrl(SERVER_URL);
