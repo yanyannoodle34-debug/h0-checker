@@ -346,7 +346,12 @@ public class EmbeddedServer extends NanoHTTPD {
         try {
             JSONObject err = new JSONObject();
             err.put("error", message);
-            return newFixedLengthResponse(Response.Status.valueOf(code), "application/json", err.toString());
+            Response.Status status = Response.Status.INTERNAL_ERROR;
+            if (code == 401) status = Response.Status.UNAUTHORIZED;
+            else if (code == 404) status = Response.Status.NOT_FOUND;
+            else if (code == 400) status = Response.Status.BAD_REQUEST;
+            else if (code == 500) status = Response.Status.INTERNAL_ERROR;
+            return newFixedLengthResponse(status, "application/json", err.toString());
         } catch (Exception e) {
             return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", message);
         }
