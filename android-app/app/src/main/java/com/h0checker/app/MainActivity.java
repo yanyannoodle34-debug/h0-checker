@@ -10,7 +10,9 @@ import android.util.Log;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
+import android.webkit.ConsoleMessage;
 import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -49,6 +51,9 @@ public class MainActivity extends Activity {
 
         webView = findViewById(R.id.webView);
         progressBar = findViewById(R.id.progressBar);
+
+        // Initialize database
+        DatabaseHelper.getInstance(this);
 
         // Start embedded server
         startServer();
@@ -90,6 +95,23 @@ public class MainActivity extends Activity {
             public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
                 Toast.makeText(MainActivity.this, "Error: " + description, Toast.LENGTH_SHORT).show();
             }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                // Auto-login: inject user into localStorage
+                view.evaluateJavascript(
+                    "(function() {" +
+                    "  try {" +
+                    "    var user = localStorage.getItem('h0_user');" +
+                    "    if (!user) {" +
+                    "      localStorage.setItem('h0_user', JSON.stringify({id:'admin-001',username:'admin',role:'admin'}));" +
+                    "      console.log('[H0] Auto-login: user set');" +
+                    "    }" +
+                    "  } catch(e) { console.log('[H0] Auto-login error:', e); }" +
+                    "})()", null
+                );
+            }
         });
 
         webView.setWebChromeClient(new WebChromeClient() {
@@ -101,6 +123,12 @@ public class MainActivity extends Activity {
                 } else {
                     progressBar.setVisibility(View.GONE);
                 }
+            }
+
+            @Override
+            public boolean onConsoleMessage(ConsoleMessage msg) {
+                Log.d(TAG, "WebView: " + msg.message());
+                return true;
             }
 
             @Override
@@ -121,8 +149,6 @@ public class MainActivity extends Activity {
         });
 
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
-
-        // Load from embedded server
         webView.loadUrl(SERVER_URL);
     }
 
@@ -131,36 +157,29 @@ public class MainActivity extends Activity {
             try {
                 server = new EmbeddedServer(this, SERVER_PORT);
                 server.startServer();
-                Log.i(TAG, "Embedded server running on " + SERVER_URL);
+                Log.i(TAG, "Server running on " + SERVER_URL);
             } catch (IOException e) {
-                Log.e(TAG, "Failed to start server", e);
+                Log.e(TAG, "Server failed", e);
                 runOnUiThread(() ->
                     Toast.makeText(this, "Server failed: " + e.getMessage(), Toast.LENGTH_LONG).show()
                 );
             }
         }).start();
 
-        // Wait a moment for server to start
-        try {
-            Thread.sleep(500);
-        } catch (InterruptedException ignored) {}
+        try { Thread.sleep(800); } catch (InterruptedException ignored) {}
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == FILE_CHOOSER_REQUEST) {
-            if (fileUploadCallback != null) {
-                Uri[] results = null;
-                if (resultCode == RESULT_OK && data != null) {
-                    String dataString = data.getDataString();
-                    if (dataString != null) {
-                        results = new Uri[]{Uri.parse(dataString)};
-                    }
-                }
-                fileUploadCallback.onReceiveValue(results);
-                fileUploadCallback = null;
+        if (requestCode == FILE_CHOOSER_REQUEST && fileUploadCallback != null) {
+            Uri[] results = null;
+            if (resultCode == RESULT_OK && data != null) {
+                String dataString = data.getDataString();
+                if (dataString != null) results = new Uri[]{Uri.parse(dataString)};
             }
+            fileUploadCallback.onReceiveValue(results);
+            fileUploadCallback = null;
         }
     }
 
@@ -187,12 +206,8 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        if (server != null) {
-            server.stop();
-        }
-        if (webView != null) {
-            webView.destroy();
-        }
+        if (server != null) server.stop();
+        if (webView != null) webView.destroy();
         super.onDestroy();
     }
 }
