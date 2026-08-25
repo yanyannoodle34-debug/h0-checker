@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
@@ -19,11 +20,17 @@ import android.webkit.WebViewClient;
 import android.widget.ProgressBar;
 import android.widget.Toast;
 
+import java.io.IOException;
+
 public class MainActivity extends Activity {
+
+    private static final String TAG = "H0Checker";
+    private static final int SERVER_PORT = 8080;
+    private static final String SERVER_URL = "http://127.0.0.1:" + SERVER_PORT;
 
     private WebView webView;
     private ProgressBar progressBar;
-    private static final String SERVER_URL = "http://10.0.2.2:5000";
+    private EmbeddedServer server;
     private static final int FILE_CHOOSER_REQUEST = 100;
     private ValueCallback<Uri[]> fileUploadCallback;
 
@@ -43,6 +50,10 @@ public class MainActivity extends Activity {
         webView = findViewById(R.id.webView);
         progressBar = findViewById(R.id.progressBar);
 
+        // Start embedded server
+        startServer();
+
+        // WebView settings
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
@@ -67,7 +78,7 @@ public class MainActivity extends Activity {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 String url = request.getUrl().toString();
-                if (url.startsWith("http://10.0.2.2") || url.startsWith("http://localhost")) {
+                if (url.startsWith("http://127.0.0.1") || url.startsWith("http://localhost")) {
                     return false;
                 }
                 Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
@@ -77,7 +88,7 @@ public class MainActivity extends Activity {
 
             @Override
             public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
-                Toast.makeText(MainActivity.this, "Connection error: " + description, Toast.LENGTH_SHORT).show();
+                Toast.makeText(MainActivity.this, "Error: " + description, Toast.LENGTH_SHORT).show();
             }
         });
 
@@ -110,7 +121,29 @@ public class MainActivity extends Activity {
         });
 
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+
+        // Load from embedded server
         webView.loadUrl(SERVER_URL);
+    }
+
+    private void startServer() {
+        new Thread(() -> {
+            try {
+                server = new EmbeddedServer(this, SERVER_PORT);
+                server.startServer();
+                Log.i(TAG, "Embedded server running on " + SERVER_URL);
+            } catch (IOException e) {
+                Log.e(TAG, "Failed to start server", e);
+                runOnUiThread(() ->
+                    Toast.makeText(this, "Server failed: " + e.getMessage(), Toast.LENGTH_LONG).show()
+                );
+            }
+        }).start();
+
+        // Wait a moment for server to start
+        try {
+            Thread.sleep(500);
+        } catch (InterruptedException ignored) {}
     }
 
     @Override
@@ -154,6 +187,9 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (server != null) {
+            server.stop();
+        }
         if (webView != null) {
             webView.destroy();
         }
