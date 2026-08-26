@@ -2,198 +2,208 @@ package com.h0checker.app;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
-import android.util.Base64;
 import android.util.Log;
-import android.view.Gravity;
-import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
-import org.json.JSONObject;
-
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Hidden WebView that executes fetch() calls to Stripe API.
- * Uses Chromium's TLS fingerprint (JA3/JA4) so Stripe sees it as a real browser.
- * 
- * This is the key difference: Android HttpURLConnection uses Java/Conscrypt TLS
- * which has a different JA3 fingerprint. Stripe detects this and blocks with
- * "integration surface" error. WebView uses Chromium TLS = same fingerprint as Chrome.
+ * Hidden WebView that executes fetch() to Stripe API using Chromium's TLS fingerprint.
+ *
+ * KEY INSIGHT: Android HttpURLConnection uses Java/Conscrypt TLS (JA3 ≠ Chrome).
+ * Stripe rejects it with "integration surface". WebView IS Chromium, so TLS matches.
+ *
+ * We load the REAL https://js.stripe.com page so:
+ *  - Origin is actually "https://js.stripe.com" (forbidden headers can't be spoofed)
+ *  - TLS fingerprint is Chrome's
+ *  - CORS is properly set up for api.stripe.com
  */
 public class StripeWebBridge {
 
-    private static final String TAG = "StripeWebBridge";
+    private static final String TAG = "StripeBridge";
     private static StripeWebBridge instance;
+    private Activity activity;
     private WebView webView;
     private volatile boolean ready = false;
-    private volatile String lastResult = null;
-    private volatile int lastStatus = 0;
     private CountDownLatch latch;
+    private String lastResult = null;
 
     @SuppressLint("SetJavaScriptEnabled")
-    public static void init(Activity activity) {
+    public static void init(Activity act) {
         if (instance != null) return;
         instance = new StripeWebBridge();
-        instance.setup(activity);
+        instance.activity = act;
+        act.runOnUiThread(() -> instance.setup(act));
     }
 
-    public static StripeWebBridge getInstance() {
-        return instance;
-    }
+    public static StripeWebBridge getInstance() { return instance; }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private void setup(Activity activity) {
-        activity.runOnUiThread(() -> {
-            webView = new WebView(activity);
-            webView.setLayoutParams(new ViewGroup.LayoutParams(1, 1));
-            webView.setAlpha(0f);
-            webView.setVisibility(View.GONE);
+    private void setup(Activity act) {
+        webView = new WebView(act);
+        webView.setLayoutParams(new ViewGroup.LayoutParams(1, 1));
+        webView.setAlpha(0f);
+        webView.setVisibility(android.view.View.GONE);
 
-            WebSettings s = webView.getSettings();
-            s.setJavaScriptEnabled(true);
-            s.setDomStorageEnabled(true);
-            s.setCacheMode(WebSettings.LOAD_DEFAULT);
-            s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        WebSettings s = webView.getSettings();
+        s.setJavaScriptEnabled(true);
+        s.setDomStorageEnabled(true);
+        s.setCacheMode(WebSettings.LOAD_DEFAULT);
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
 
-            webView.addJavascriptInterface(new BridgeInterface(), "AndroidBridge");
-            webView.setWebViewClient(new WebViewClient() {
-                @Override
-                public void onPageFinished(WebView view, String url) {
-                    ready = true;
-                    Log.i(TAG, "WebView ready at: " + url);
-                }
-            });
+        webView.addJavascriptInterface(new BridgeJS(), "StripeBridge");
 
-            // Add to root view (invisible)
-            ViewGroup root = (ViewGroup) activity.getWindow().getDecorView().findViewById(android.R.id.content);
-            root.addView(webView);
-
-            // Load a minimal page so fetch() works from same-origin context
-            webView.loadDataWithBaseURL(
-                "https://js.stripe.com",
-                "<!DOCTYPE html><html><head><title>stripe-bridge</title></head><body></body></html>",
-                "text/html", "UTF-8", null
-            );
-            Log.i(TAG, "StripeWebBridge initialized");
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                Log.i(TAG, "Page loaded: " + url);
+                ready = true;
+            }
         });
+
+        ViewGroup root = (ViewGroup) act.getWindow().getDecorView()
+                .findViewById(android.R.id.content);
+        root.addView(webView);
+
+        // Load the REAL js.stripe.com so origin = "https://js.stripe.com"
+        webView.loadUrl("https://js.stripe.com");
+        Log.i(TAG, "Loading js.stripe.com for Chromium TLS + correct origin");
     }
 
     /**
-     * Execute a POST request to Stripe API via WebView's Chromium fetch().
-     * Blocks until the response arrives (up to 30 seconds).
+     * POST to Stripe API via WebView's Chromium fetch().
+     * The page origin is real "https://js.stripe.com" so CORS works.
+     * TLS fingerprint is Chrome's, so Stripe accepts the request.
      */
     public String fetchStripePost(String url, Map<String, String> headers, String body) {
+        // Wait for page to load
         if (!ready) {
-            Log.w(TAG, "WebView not ready, waiting...");
-            long deadline = System.currentTimeMillis() + 10000;
+            Log.w(TAG, "Waiting for js.stripe.com to load...");
+            long deadline = System.currentTimeMillis() + 15000;
             while (!ready && System.currentTimeMillis() < deadline) {
-                try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+                try { Thread.sleep(200); } catch (InterruptedException ignored) {}
             }
             if (!ready) {
-                Log.e(TAG, "WebView still not ready after 10s");
+                Log.e(TAG, "js.stripe.com did not load in 15s");
                 return "{\"error\":{\"message\":\"WebView not ready\"}}";
             }
         }
 
         latch = new CountDownLatch(1);
         lastResult = null;
-        lastStatus = 0;
 
-        // Build JavaScript fetch call
-        StringBuilder jsHeaders = new StringBuilder("{");
+        // Build headers JSON — skip Origin/Referer (forbidden, browser sets them automatically)
+        StringBuilder hJson = new StringBuilder("{");
         int i = 0;
         for (Map.Entry<String, String> e : headers.entrySet()) {
-            if (i > 0) jsHeaders.append(",");
-            jsHeaders.append("'").append(escapeJs(e.getKey())).append("':'").append(escapeJs(e.getValue())).append("'");
+            String key = e.getKey();
+            // Skip forbidden headers — browser sets these from the page's real origin
+            if (key.equalsIgnoreCase("Origin") || key.equalsIgnoreCase("Referer")) continue;
+            if (i > 0) hJson.append(",");
+            hJson.append(JSON(key)).append(":").append(JSON(e.getValue()));
             i++;
         }
-        jsHeaders.append("}");
+        hJson.append("}");
 
-        // Escape body for JavaScript string literal
-        String escapedBody = escapeJs(body);
+        String jsBody = escapeJS(body);
 
-        String js = String.format(
-            "(function() {" +
-            "  try {" +
-            "    fetch('%s', {" +
-            "      method: 'POST'," +
-            "      headers: %s," +
-            "      body: '%s'," +
-            "      mode: 'cors'," +
-            "      credentials: 'omit'" +
-            "    }).then(function(r) {" +
-            "      return r.text().then(function(t) {" +
-            "        AndroidBridge.onResponse(r.status, t);" +
-            "      });" +
-            "    }).catch(function(e) {" +
-            "      AndroidBridge.onError(e.message || String(e));" +
-            "    });" +
-            "  } catch(e) {" +
-            "    AndroidBridge.onError(e.message || String(e));" +
-            "  }" +
-            "})()",
-            escapeJs(url),
-            jsHeaders.toString(),
-            escapedBody
-        );
+        // Execute fetch() from real js.stripe.com origin
+        String js = "(function(){\n" +
+            "try{\n" +
+            "  fetch(" + JSON(url) + ",{\n" +
+            "    method:'POST',\n" +
+            "    headers:" + hJson + ",\n" +
+            "    body:" + JSON(jsBody) + ",\n" +
+            "    mode:'cors',\n" +
+            "    credentials:'omit'\n" +
+            "  }).then(function(r){\n" +
+            "    return r.text().then(function(t){\n" +
+            "      StripeBridge.onResult(r.status,t);\n" +
+            "    });\n" +
+            "  })[" + "catch](function(e){\n" +
+            "    StripeBridge.onError(e.message||String(e));\n" +
+            "  });\n" +
+            "}catch(e){StripeBridge.onError(e.message||String(e));}\n" +
+            "})()";
 
-        activity().runOnUiThread(() -> webView.evaluateJavascript(js, null));
+        final String fjs = js;
+        if (activity != null) {
+            activity.runOnUiThread(() -> {
+                try {
+                    webView.evaluateJavascript(fjs, value -> {
+                        Log.d(TAG, "eval result: " + value);
+                    });
+                } catch (Exception e) {
+                    Log.e(TAG, "eval failed: " + e.getMessage());
+                    lastResult = "{\"error\":{\"message\":\"eval failed: " + e.getMessage() + "\"}}";
+                    if (latch != null) latch.countDown();
+                }
+            });
+        }
 
         try {
-            latch.await(30, TimeUnit.SECONDS);
+            boolean done = latch.await(30, TimeUnit.SECONDS);
+            if (!done) Log.w(TAG, "Timeout waiting for Stripe response");
         } catch (InterruptedException e) {
-            Log.e(TAG, "Interrupted waiting for response");
+            Log.e(TAG, "Interrupted");
         }
 
         if (lastResult != null) return lastResult;
-        return "{\"error\":{\"message\":\"No response from WebView\"}}";
+        return "{\"error\":{\"message\":\"No response from Stripe bridge\"}}";
     }
 
-    private Activity activity() {
-        // Get the current activity from the main thread
-        return (Activity) webView.getContext();
-    }
-
-    private String escapeJs(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\")
-                .replace("'", "\\'")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\u2028", "\\u2028")
-                .replace("\u2029", "\\u2029");
-    }
-
-    private class BridgeInterface {
+    private class BridgeJS {
         @JavascriptInterface
-        public void onResponse(int status, String body) {
-            lastStatus = status;
+        public void onResult(int status, String body) {
+            Log.i(TAG, "Stripe response: status=" + status + " len=" + (body != null ? body.length() : 0));
             lastResult = body;
             if (latch != null) latch.countDown();
-            Log.d(TAG, "Response received: status=" + status + " len=" + (body != null ? body.length() : 0));
         }
 
         @JavascriptInterface
-        public void onError(String message) {
-            lastResult = "{\"error\":{\"message\":\"" + message.replace("\"", "'") + "\"}}";
+        public void onError(String msg) {
+            Log.e(TAG, "JS error: " + msg);
+            lastResult = "{\"error\":{\"message\":\"" + escapeJSON(msg) + "\"}}";
             if (latch != null) latch.countDown();
-            Log.e(TAG, "JS Error: " + message);
         }
     }
 
     public void destroy() {
         if (webView != null) {
             webView.post(() -> {
-                webView.loadDataWithBaseURL(null, "", "text/html", "UTF-8", null);
+                webView.loadUrl("about:blank");
                 webView.destroy();
             });
         }
         instance = null;
+    }
+
+    // JSON string helper
+    private static String JSON(String s) {
+        return "'" + escapeJS(s) + "'";
+    }
+
+    private static String escapeJS(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\")
+                .replace("'", "\\'")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("/", "\\/");
+    }
+
+    private static String escapeJSON(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r");
     }
 }
