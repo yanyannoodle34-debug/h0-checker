@@ -2,8 +2,13 @@ package com.h0checker.app;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.graphics.Color;
+import android.graphics.PixelFormat;
 import android.util.Log;
+import android.view.Gravity;
+import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -14,11 +19,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Loads the gate's site in a hidden WebView, then executes raw fetch() calls
- * to Stripe API from the site's origin.
+ * Loads the gate's site in a 1x1 pixel WebView overlay, then executes
+ * raw fetch() to Stripe API from the site's origin.
  *
- * Requests are serialized (only one in flight at a time) to avoid race conditions
- * between the JS callback and the Java latch.
+ * KEY: WebView must be VISIBLE (even 1px) for JS to execute on all devices.
+ * GONE/invisible WebViews get JS throttled or killed by Android battery saver.
  */
 public class StripeWebBridge {
 
@@ -26,10 +31,8 @@ public class StripeWebBridge {
     private static StripeWebBridge instance;
     private Activity activity;
     private WebView webView;
-    private volatile boolean pageLoaded = false;
     private String loadedSiteUrl = null;
 
-    // Per-request state — only one request at a time
     private CountDownLatch curLatch;
     private String[] curResult;
 
@@ -46,9 +49,16 @@ public class StripeWebBridge {
     @SuppressLint("SetJavaScriptEnabled")
     private void createWebView(Activity act) {
         webView = new WebView(act);
-        webView.setLayoutParams(new ViewGroup.LayoutParams(1, 1));
-        webView.setAlpha(0f);
-        webView.setVisibility(android.view.View.GONE);
+
+        // 1x1 pixel overlay — MUST be visible for JS to execute
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+            1, 1,
+            WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+            PixelFormat.TRANSLUCENT
+        );
+        params.gravity = Gravity.TOP | Gravity.START;
 
         WebSettings s = webView.getSettings();
         s.setJavaScriptEnabled(true);
@@ -57,17 +67,23 @@ public class StripeWebBridge {
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
 
         webView.addJavascriptInterface(new BridgeJS(), "SB");
+        webView.setBackgroundColor(Color.TRANSPARENT);
 
-        ViewGroup root = (ViewGroup) act.getWindow().getDecorView()
-                .findViewById(android.R.id.content);
-        root.addView(webView);
+        // Attach as overlay — visible but 1px, so JS runs
+        try {
+            act.addContentView(webView, params);
+        } catch (Exception e) {
+            // Fallback: add to root view
+            ViewGroup root = (ViewGroup) act.getWindow().getDecorView()
+                    .findViewById(android.R.id.content);
+            root.addView(webView, new ViewGroup.LayoutParams(1, 1));
+        }
 
-        Log.i(TAG, "WebView created");
+        Log.i(TAG, "WebView created (1px overlay, JS enabled)");
     }
 
     /**
      * Execute a POST to Stripe API via fetch() from the site's WebView context.
-     * Serialized — only one request at a time to avoid latch race conditions.
      */
     public synchronized String post(String siteUrl, String apiUrl,
                                      Map<String, String> headers, String body) {
@@ -77,25 +93,22 @@ public class StripeWebBridge {
 
         String cleanSite = siteUrl.replaceAll("/+$", "");
 
-        // Step 1: Load the site if not already loaded
+        // Step 1: Load site if needed
         if (!cleanSite.equals(loadedSiteUrl)) {
             Log.i(TAG, "Loading site: " + cleanSite);
             loadedSiteUrl = cleanSite;
-            pageLoaded = false;
 
             final CountDownLatch loadLatch = new CountDownLatch(1);
             activity.runOnUiThread(() -> {
                 webView.setWebViewClient(new WebViewClient() {
                     @Override
                     public void onPageFinished(WebView view, String url) {
-                        Log.i(TAG, "Page loaded: " + url);
-                        pageLoaded = true;
+                        Log.i(TAG, "Loaded: " + url);
                         loadLatch.countDown();
                     }
                     @Override
                     public void onReceivedError(WebView view, int code, String desc, String url) {
-                        Log.e(TAG, "Error: " + desc);
-                        pageLoaded = true;
+                        Log.e(TAG, "Load error " + code + ": " + desc);
                         loadLatch.countDown();
                     }
                 });
@@ -103,17 +116,30 @@ public class StripeWebBridge {
             });
 
             try {
-                if (!loadLatch.await(15, TimeUnit.SECONDS)) {
-                    Log.w(TAG, "Site load timeout, proceeding anyway");
+                if (!loadLatch.await(20, TimeUnit.SECONDS)) {
+                    Log.w(TAG, "Site load timeout");
                 }
             } catch (InterruptedException e) {
                 return "{\"error\":{\"message\":\"Interrupted\"}}";
             }
 
-            try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+            // Wait for page JS to settle
+            try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+
+            // Debug: check if fetch is available
+            final String[] checkResult = {null};
+            final CountDownLatch checkLatch = new CountDownLatch(1);
+            activity.runOnUiThread(() -> {
+                webView.evaluateJavascript(
+                    "(function(){try{return typeof fetch}catch(e){return 'error:'+e.message}}})()",
+                    v -> { checkResult[0] = v; checkLatch.countDown(); }
+                );
+            });
+            try { checkLatch.await(5, TimeUnit.SECONDS); } catch (InterruptedException ignored) {}
+            Log.i(TAG, "fetch type: " + checkResult[0]);
         }
 
-        // Step 2: Build fetch() JS
+        // Step 2: Build and execute fetch()
         StringBuilder headersJs = new StringBuilder("{");
         boolean first = true;
         for (Map.Entry<String, String> e : headers.entrySet()) {
@@ -127,27 +153,31 @@ public class StripeWebBridge {
 
         String js = "(function(){" +
             "try{" +
-            "  fetch(" + jsStr(apiUrl) + ",{" +
+            "  var p=fetch(" + jsStr(apiUrl) + ",{" +
             "    method:'POST'," +
             "    headers:" + headersJs + "," +
             "    body:" + jsStr(body) + "," +
             "    mode:'cors'," +
             "    credentials:'omit'" +
-            "  }).then(function(r){" +
+            "  });" +
+            "  p.then(function(r){" +
             "    return r.text().then(function(t){" +
             "      SB.onResult(r.status,t);" +
             "    });" +
             "  })[" + "catch](function(e){" +
-            "    SB.onError(e.message||String(e));" +
+            "    SB.onError('catch:'+e.message);" +
             "  });" +
-            "}catch(e){SB.onError(e.message||String(e));}" +
+            "  p[" + "catch](function(e){" +
+            "    SB.onError('promise:'+e.message);" +
+            "  });" +
+            "}catch(e){SB.onError('throw:'+e.message);}" +
             "})()";
 
-        // Step 3: Execute and wait — serialized, no race condition
         curLatch = new CountDownLatch(1);
         curResult = new String[]{null};
 
         final String fjs = js;
+        Log.i(TAG, "Executing fetch to: " + apiUrl);
         activity.runOnUiThread(() -> {
             try {
                 webView.evaluateJavascript(fjs, v -> Log.d(TAG, "eval=" + v));
@@ -168,7 +198,11 @@ public class StripeWebBridge {
         curLatch = null;
         curResult = null;
 
-        if (result != null) return result;
+        if (result != null) {
+            Log.i(TAG, "Result: " + result.substring(0, Math.min(result.length(), 200)));
+            return result;
+        }
+        Log.e(TAG, "No response from bridge (30s timeout)");
         return "{\"error\":{\"message\":\"No response from bridge\"}}";
     }
 
@@ -182,14 +216,14 @@ public class StripeWebBridge {
     private class BridgeJS {
         @JavascriptInterface
         public void onResult(int status, String body) {
-            Log.i(TAG, "Response: status=" + status + " len=" + (body != null ? body.length() : 0));
+            Log.i(TAG, "OK status=" + status + " len=" + (body != null ? body.length() : 0));
             if (curResult != null) curResult[0] = body;
             if (curLatch != null) curLatch.countDown();
         }
 
         @JavascriptInterface
         public void onError(String msg) {
-            Log.e(TAG, "Fetch error: " + msg);
+            Log.e(TAG, "JS error: " + msg);
             if (curResult != null) curResult[0] = "{\"error\":{\"message\":\"" + msg.replace("\"", "'") + "\"}}";
             if (curLatch != null) curLatch.countDown();
         }
