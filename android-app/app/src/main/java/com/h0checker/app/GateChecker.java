@@ -168,7 +168,7 @@ public class GateChecker {
             body.append("&time_on_page=").append(rand.nextInt(30000) + 5000);
             body.append("&key=").append(encode(pk));
 
-            String resp = httpPost("https://api.stripe.com/v1/" + endpoint, body.toString(), h);
+            String resp = stripePost("https://api.stripe.com/v1/" + endpoint, body.toString(), h);
             JSONObject json = new JSONObject(resp);
 
             if (json.has("id")) {
@@ -285,7 +285,7 @@ public class GateChecker {
         h.put("Authorization", "Bearer " + sk);
         if (!acct.isEmpty()) h.put("Stripe-Account", acct);
 
-        String resp = httpPost("https://api.stripe.com/v1/payment_methods", body.toString(), h);
+        String resp = stripePost("https://api.stripe.com/v1/payment_methods", body.toString(), h);
         return classifyStripe(resp);
     }
 
@@ -404,7 +404,7 @@ public class GateChecker {
         Map<String, String> tokH = buildStripeHeaders();
         if (!sk.isEmpty()) tokH.put("Authorization", "Bearer " + sk);
 
-        String tokResp = httpPost("https://api.stripe.com/v1/tokens", tokBody.toString(), tokH);
+        String tokResp = stripePost("https://api.stripe.com/v1/tokens", tokBody.toString(), tokH);
         JSONObject tokJson = new JSONObject(tokResp);
         String tokenId = tokJson.optString("id", "");
 
@@ -427,7 +427,7 @@ public class GateChecker {
             pmBody.append("&time_on_page=").append(rand.nextInt(30000) + 5000);
             if (!pk.isEmpty()) pmBody.append("&key=").append(encode(pk));
 
-            String pmResp = httpPost("https://api.stripe.com/v1/payment_methods", pmBody.toString(), tokH);
+            String pmResp = stripePost("https://api.stripe.com/v1/payment_methods", pmBody.toString(), tokH);
             JSONObject pmJson = new JSONObject(pmResp);
             tokenId = pmJson.optString("id", "");
         }
@@ -457,7 +457,7 @@ public class GateChecker {
         Map<String, String> confH = buildStripeHeaders();
         if (!sk.isEmpty()) confH.put("Authorization", "Bearer " + sk);
 
-        String confResp = httpPost("https://api.stripe.com/v1/" + intentType + "/" + piId + "/confirm",
+        String confResp = stripePost("https://api.stripe.com/v1/" + intentType + "/" + piId + "/confirm",
                                     confBody.toString(), confH);
         return classifyStripeConfirm(confResp);
     }
@@ -552,7 +552,7 @@ public class GateChecker {
         body.put("success_url", siteUrl + "/success");
         body.put("cancel_url", siteUrl + "/cancel");
 
-        String resp = httpPost("https://api.stripe.com/v1/checkout/sessions", body.toString(), h);
+        String resp = stripePost("https://api.stripe.com/v1/checkout/sessions", body.toString(), h);
         JSONObject json = new JSONObject(resp);
         String csId = json.optString("id", "");
         String setupClientSecret = json.optString("setup_intent_client_secret", "");
@@ -1019,6 +1019,27 @@ public class GateChecker {
             while ((l=r.readLine())!=null) sb.append(l);
             r.close(); return sb.toString();
         } finally { c.disconnect(); }
+    }
+
+    /**
+     * Stripe-specific POST that routes through WebView's Chromium TLS.
+     * Falls back to HttpURLConnection if WebView is not available.
+     */
+    private static String stripePost(String urlStr, String body, Map<String,String> headers) {
+        StripeWebBridge bridge = StripeWebBridge.getInstance();
+        if (bridge != null) {
+            try {
+                return bridge.fetchStripePost(urlStr, headers, body);
+            } catch (Exception e) {
+                Log.e(TAG, "WebView Stripe call failed, falling back: " + e.getMessage());
+            }
+        }
+        // Fallback to HttpURLConnection (may get "integration surface" error)
+        try {
+            return httpPost(urlStr, body, headers);
+        } catch (Exception e) {
+            return "{\"error\":{\"message\":\"" + e.getMessage() + "\"}}";
+        }
     }
 
     private static String randomName() {

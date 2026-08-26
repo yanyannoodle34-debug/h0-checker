@@ -139,6 +139,9 @@ public class MainActivity extends Activity {
 
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
 
+        // Initialize hidden WebView for Stripe API calls (Chromium TLS fingerprint)
+        StripeWebBridge.init(this);
+
         // Load the app
         webView.loadUrl(SERVER_URL);
     }
@@ -225,6 +228,8 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        StripeWebBridge bridge = StripeWebBridge.getInstance();
+        if (bridge != null) bridge.destroy();
         if (server != null) server.stop();
         if (webView != null) webView.destroy();
         super.onDestroy();
