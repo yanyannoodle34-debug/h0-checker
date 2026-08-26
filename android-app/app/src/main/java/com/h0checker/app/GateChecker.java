@@ -426,7 +426,7 @@ public class GateChecker {
         String siteUrl = s.optString("siteUrl", "");
         if (siteUrl.isEmpty()) return error("No Shopify site URL configured");
         String sk = s.optString("secretKey", s.optString("stripeSecretKey",""));
-        if (!sk.isEmpty()) return stripeCreatePM(number, month, year, cvv, sk, "", "");
+        if (!sk.isEmpty()) return stripeCreatePM(number, month, year, cvv, sk, "");
 
         String scope = extractShopifyScope(siteUrl);
 
@@ -571,7 +571,7 @@ public class GateChecker {
         String cu = s.optString("checkoutUrl", "https://checkout-api.adyen.com/v71/payments");
 
         String sk = s.optString("secretKey", s.optString("stripeSecretKey",""));
-        if (!sk.isEmpty()) return stripeCreatePM(number, month, year, cvv, sk, "", "");
+        if (!sk.isEmpty()) return stripeCreatePM(number, month, year, cvv, sk, "");
 
         if ((ck.isEmpty() || ma.isEmpty()) && !siteUrl.isEmpty()) {
             Map<String, String> h = new HashMap<>();
