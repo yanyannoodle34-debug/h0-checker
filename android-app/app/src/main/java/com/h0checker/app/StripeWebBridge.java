@@ -15,13 +15,10 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Loads the gate's site in a hidden WebView, then executes raw fetch() calls
- * to Stripe API from the site's origin. This gives us:
- * - Chromium TLS fingerprint (JA3/JA4) — Stripe sees real browser
- * - Correct Origin header — site's domain, which has CORS for api.stripe.com
- * - Real cookies/session from the site
+ * to Stripe API from the site's origin.
  *
- * Unlike the Stripe.js approach, this works even if Stripe.js hasn't loaded
- * or the page has CAPTCHA/auth wall — we just need the origin.
+ * Requests are serialized (only one in flight at a time) to avoid race conditions
+ * between the JS callback and the Java latch.
  */
 public class StripeWebBridge {
 
@@ -31,6 +28,10 @@ public class StripeWebBridge {
     private WebView webView;
     private volatile boolean pageLoaded = false;
     private String loadedSiteUrl = null;
+
+    // Per-request state — only one request at a time
+    private CountDownLatch curLatch;
+    private String[] curResult;
 
     @SuppressLint("SetJavaScriptEnabled")
     public static void init(Activity act) {
@@ -66,22 +67,17 @@ public class StripeWebBridge {
 
     /**
      * Execute a POST to Stripe API via fetch() from the site's WebView context.
-     * The site's origin handles CORS for api.stripe.com.
-     *
-     * @param siteUrl  The gate's site URL (loaded in WebView for correct origin)
-     * @param apiUrl   The Stripe API endpoint (e.g., https://api.stripe.com/v1/tokens)
-     * @param headers  HTTP headers (Content-Type, Authorization, etc.)
-     * @param body     URL-encoded body
-     * @return         JSON response from Stripe API
+     * Serialized — only one request at a time to avoid latch race conditions.
      */
-    public String post(String siteUrl, String apiUrl, Map<String, String> headers, String body) {
+    public synchronized String post(String siteUrl, String apiUrl,
+                                     Map<String, String> headers, String body) {
         if (activity == null || webView == null) {
             return "{\"error\":{\"message\":\"Bridge not initialized\"}}";
         }
 
         String cleanSite = siteUrl.replaceAll("/+$", "");
 
-        // Step 1: Load the site if not already loaded (gives us correct origin)
+        // Step 1: Load the site if not already loaded
         if (!cleanSite.equals(loadedSiteUrl)) {
             Log.i(TAG, "Loading site: " + cleanSite);
             loadedSiteUrl = cleanSite;
@@ -108,38 +104,33 @@ public class StripeWebBridge {
 
             try {
                 if (!loadLatch.await(15, TimeUnit.SECONDS)) {
-                    Log.w(TAG, "Site load timeout, trying anyway");
+                    Log.w(TAG, "Site load timeout, proceeding anyway");
                 }
             } catch (InterruptedException e) {
                 return "{\"error\":{\"message\":\"Interrupted\"}}";
             }
 
-            // Brief wait for JS context to settle
-            try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+            try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
         }
 
-        // Step 2: Execute fetch() from the site's origin
+        // Step 2: Build fetch() JS
         StringBuilder headersJs = new StringBuilder("{");
-        int i = 0;
+        boolean first = true;
         for (Map.Entry<String, String> e : headers.entrySet()) {
             String k = e.getKey();
-            // Skip Origin/Referer — browser sets from page's real origin
-            if (k.equalsIgnoreCase("Origin") || k.equalsIgnoreCase("Referer")) { i++; continue; }
-            if (i > 0) headersJs.append(",");
+            if (k.equalsIgnoreCase("Origin") || k.equalsIgnoreCase("Referer")) continue;
+            if (!first) headersJs.append(",");
             headersJs.append(jsStr(k)).append(":").append(jsStr(e.getValue()));
-            i++;
+            first = false;
         }
         headersJs.append("}");
 
-        String jsBody = jsStr(body);
-        String jsUrl = jsStr(apiUrl);
-
         String js = "(function(){" +
             "try{" +
-            "  fetch(" + jsUrl + ",{" +
+            "  fetch(" + jsStr(apiUrl) + ",{" +
             "    method:'POST'," +
             "    headers:" + headersJs + "," +
-            "    body:" + jsBody + "," +
+            "    body:" + jsStr(body) + "," +
             "    mode:'cors'," +
             "    credentials:'omit'" +
             "  }).then(function(r){" +
@@ -152,12 +143,9 @@ public class StripeWebBridge {
             "}catch(e){SB.onError(e.message||String(e));}" +
             "})()";
 
-        final CountDownLatch latch = new CountDownLatch(1);
-        final String[] result = {null};
-
-        // Store latch in bridge JS interface
-        resultLatch = latch;
-        resultRef = result;
+        // Step 3: Execute and wait — serialized, no race condition
+        curLatch = new CountDownLatch(1);
+        curResult = new String[]{null};
 
         final String fjs = js;
         activity.runOnUiThread(() -> {
@@ -165,24 +153,24 @@ public class StripeWebBridge {
                 webView.evaluateJavascript(fjs, v -> Log.d(TAG, "eval=" + v));
             } catch (Exception e) {
                 Log.e(TAG, "eval failed: " + e.getMessage());
-                result[0] = "{\"error\":{\"message\":\"eval: " + e.getMessage() + "\"}}";
-                latch.countDown();
+                curResult[0] = "{\"error\":{\"message\":\"eval: " + e.getMessage() + "\"}}";
+                curLatch.countDown();
             }
         });
 
         try {
-            latch.await(30, TimeUnit.SECONDS);
+            curLatch.await(30, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             return "{\"error\":{\"message\":\"Interrupted\"}}";
         }
 
-        if (result[0] != null) return result[0];
+        String result = curResult[0];
+        curLatch = null;
+        curResult = null;
+
+        if (result != null) return result;
         return "{\"error\":{\"message\":\"No response from bridge\"}}";
     }
-
-    // Bridge state for fetch callback
-    private CountDownLatch resultLatch;
-    private String[] resultRef;
 
     private static String jsStr(String s) {
         if (s == null) return "''";
@@ -195,15 +183,15 @@ public class StripeWebBridge {
         @JavascriptInterface
         public void onResult(int status, String body) {
             Log.i(TAG, "Response: status=" + status + " len=" + (body != null ? body.length() : 0));
-            if (resultRef != null) resultRef[0] = body;
-            if (resultLatch != null) resultLatch.countDown();
+            if (curResult != null) curResult[0] = body;
+            if (curLatch != null) curLatch.countDown();
         }
 
         @JavascriptInterface
         public void onError(String msg) {
             Log.e(TAG, "Fetch error: " + msg);
-            if (resultRef != null) resultRef[0] = "{\"error\":{\"message\":\"" + msg.replace("\"", "'") + "\"}}";
-            if (resultLatch != null) resultLatch.countDown();
+            if (curResult != null) curResult[0] = "{\"error\":{\"message\":\"" + msg.replace("\"", "'") + "\"}}";
+            if (curLatch != null) curLatch.countDown();
         }
     }
 
