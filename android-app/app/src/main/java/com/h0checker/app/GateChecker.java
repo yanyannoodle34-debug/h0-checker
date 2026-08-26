@@ -28,6 +28,10 @@ public class GateChecker {
     private static volatile String curSiteUrl = "";
     private static volatile String curPk = "";
 
+    // Bridge failure tracking — skip bridge after repeated failures
+    private static volatile int bridgeFailCount = 0;
+    private static final int BRIDGE_FAIL_THRESHOLD = 2; // skip after 2 failures
+
     private static final String[] CCN_LIVE_CODES = {
         "insufficient_funds","do_not_honor","generic_decline","call_issuer",
         "try_again_later","not_permitted","service_not_allowed",
@@ -1032,21 +1036,42 @@ public class GateChecker {
     /**
      * Stripe-specific POST that routes through the site's WebView context.
      * The site's origin handles CORS for api.stripe.com + Chromium TLS.
-     * Falls back to HttpURLConnection if bridge unavailable.
+     * Falls back to HttpURLConnection if bridge unavailable or has failed repeatedly.
      */
     private static String stripePost(String urlStr, String body, Map<String,String> headers) {
         StripeWebBridge bridge = StripeWebBridge.getInstance();
         String siteUrl = curSiteUrl;
+
+        // Skip bridge if it has failed repeatedly (saves 25s timeout per call)
+        if (bridgeFailCount >= BRIDGE_FAIL_THRESHOLD) {
+            Log.w(TAG, "stripePost: bridge skipped (failCount=" + bridgeFailCount + ") → httpPost");
+            try {
+                return httpPost(urlStr, body, headers);
+            } catch (Exception e) {
+                return "{\"error\":{\"message\":\"" + e.getMessage() + "\"}}";
+            }
+        }
+
         if (bridge != null && siteUrl != null && !siteUrl.isEmpty()) {
             try {
                 String result = bridge.post(siteUrl, urlStr, headers, body);
                 Log.i(TAG, "stripePost bridge result: " + (result != null ? result.substring(0, Math.min(result.length(), 200)) : "null"));
+
+                // Check if bridge returned an error
+                if (result != null && result.contains("\"error\"")) {
+                    bridgeFailCount++;
+                    Log.w(TAG, "stripePost bridge error (failCount=" + bridgeFailCount + "): " + result.substring(0, Math.min(result.length(), 150)));
+                } else {
+                    bridgeFailCount = 0; // Reset on success
+                }
+
                 return result;
             } catch (Exception e) {
-                Log.e(TAG, "stripePost bridge failed: " + e.getMessage());
+                bridgeFailCount++;
+                Log.e(TAG, "stripePost bridge failed (failCount=" + bridgeFailCount + "): " + e.getMessage());
             }
         }
-        Log.w(TAG, "stripePost fallback to httpPost (bridge=" + (bridge != null) + " site=" + siteUrl + ")");
+        Log.w(TAG, "stripePost fallback to httpPost (bridge=" + (bridge != null) + " site=" + siteUrl + " failCount=" + bridgeFailCount + ")");
         try {
             return httpPost(urlStr, body, headers);
         } catch (Exception e) {
