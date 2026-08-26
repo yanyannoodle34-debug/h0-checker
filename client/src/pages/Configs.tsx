@@ -31,20 +31,20 @@ const normaliseUrl = (u: string) =>
 // ── Flow metadata: human labels, descriptions, required fields ────────────────
 const FLOW_META: Record<string, Record<string, { label: string; desc: string; needs: string[]; optional?: string[] }>> = {
   stripe: {
-    auth:                           { label: "Stripe Auth (SetupIntent)",        desc: "Creates a SetupIntent — verifies the card without charging. Cheapest real check.", needs: ["publicKey"], optional: ["siteUrl"] },
-    charges:                        { label: "Stripe Charges",                   desc: "Direct charge via Charges API — creates a charge token immediately.", needs: ["publicKey"] },
-    payment_intents:                { label: "Payment Intents (WC default)",     desc: "Full WooCommerce flow: add-to-cart → checkout → confirm PaymentIntent.", needs: ["publicKey", "siteUrl"] },
-    tokenize:                       { label: "Tokenize Only",                    desc: "Creates a tok_ token. Proves card format but does NOT verify funds or charge.", needs: ["publicKey"] },
-    standard:                       { label: "Standard WC Stripe",               desc: "WooCommerce wc_stripe_process_payment AJAX action.", needs: ["publicKey", "siteUrl"] },
-    charitable:                     { label: "Charitable (WP Donation)",         desc: "WordPress Charitable plugin — scrapes nonce + creates pm_ then posts donation.", needs: ["publicKey", "siteUrl"], optional: ["donatePath"] },
-    givewp:                         { label: "GiveWP v2",                        desc: "GiveWP donation form via admin-ajax give_process_donation action.", needs: ["publicKey", "siteUrl"], optional: ["giveFormId", "donationType"] },
-    givewp_v3:                      { label: "GiveWP v3",                        desc: "GiveWP v3 REST API donation endpoint.", needs: ["publicKey", "siteUrl"], optional: ["giveFormId", "donationType"] },
-    gravityforms:                   { label: "Gravity Forms + Stripe",           desc: "Gravity Forms with Stripe add-on — scrapes gf_stripe_payment_intent nonce.", needs: ["publicKey", "siteUrl"], optional: ["gfFormId"] },
-    wp_full_stripe:                 { label: "WP Full Stripe",                   desc: "Mammothology WP Full Stripe plugin — payment + donation form variants. Scrapes wpfs-form-name + amount, tokenizes via Stripe API, POSTs to admin-ajax.", needs: ["publicKey", "siteUrl"], optional: ["wpFsFormName", "donatePath"] },
-    "3d_secure":                    { label: "3D Secure",                        desc: "Forces the 3DS challenge path — tests 3DS-enrolled cards.", needs: ["publicKey", "siteUrl"] },
-    checkout_session:               { label: "Stripe Checkout Session",          desc: "Hosted Stripe Checkout: creates a session URL and submits the card through it.", needs: ["publicKey", "siteUrl"] },
-    wc_stripe_confirm_setup_intent: { label: "WC Setup Intent Confirm",         desc: "WooCommerce wc_stripe_create_and_confirm_setup_intent AJAX — verify-only, no charge.", needs: ["publicKey", "siteUrl"] },
-    stripe_page_confirm:            { label: "Stripe Page Confirm",              desc: "Scrapes a Stripe-powered payment page and submits the card directly to it.", needs: ["publicKey", "siteUrl"] },
+    auth:                           { label: "Stripe Auth (SetupIntent)",        desc: "Creates a SetupIntent — verifies the card without charging. Cheapest real check.", needs: ["publicKey"], optional: ["siteUrl", "secretKey"] },
+    charges:                        { label: "Stripe Charges",                   desc: "Direct charge via Charges API — creates a charge token immediately.", needs: ["publicKey"], optional: ["secretKey"] },
+    payment_intents:                { label: "Payment Intents (WC default)",     desc: "Full WooCommerce flow: add-to-cart → checkout → confirm PaymentIntent.", needs: ["publicKey", "siteUrl"], optional: ["secretKey"] },
+    tokenize:                       { label: "Tokenize Only",                    desc: "Creates a tok_ token. Proves card format but does NOT verify funds or charge.", needs: ["publicKey"], optional: ["secretKey"] },
+    standard:                       { label: "Standard WC Stripe",               desc: "WooCommerce wc_stripe_process_payment AJAX action.", needs: ["publicKey", "siteUrl"], optional: ["secretKey"] },
+    charitable:                     { label: "Charitable (WP Donation)",         desc: "WordPress Charitable plugin — scrapes nonce + creates pm_ then posts donation.", needs: ["publicKey", "siteUrl"], optional: ["donatePath", "secretKey"] },
+    givewp:                         { label: "GiveWP v2",                        desc: "GiveWP donation form via admin-ajax give_process_donation action.", needs: ["publicKey", "siteUrl"], optional: ["giveFormId", "donationType", "secretKey"] },
+    givewp_v3:                      { label: "GiveWP v3",                        desc: "GiveWP v3 REST API donation endpoint.", needs: ["publicKey", "siteUrl"], optional: ["giveFormId", "donationType", "secretKey"] },
+    gravityforms:                   { label: "Gravity Forms + Stripe",           desc: "Gravity Forms with Stripe add-on — scrapes gf_stripe_payment_intent nonce.", needs: ["publicKey", "siteUrl"], optional: ["gfFormId", "secretKey"] },
+    wp_full_stripe:                 { label: "WP Full Stripe",                   desc: "Mammothology WP Full Stripe plugin — payment + donation form variants. Scrapes wpfs-form-name + amount, tokenizes via Stripe API, POSTs to admin-ajax.", needs: ["publicKey", "siteUrl"], optional: ["wpFsFormName", "donatePath", "secretKey"] },
+    "3d_secure":                    { label: "3D Secure",                        desc: "Forces the 3DS challenge path — tests 3DS-enrolled cards.", needs: ["publicKey", "siteUrl"], optional: ["secretKey"] },
+    checkout_session:               { label: "Stripe Checkout Session",          desc: "Hosted Stripe Checkout: creates a session URL and submits the card through it.", needs: ["publicKey", "siteUrl"], optional: ["secretKey"] },
+    wc_stripe_confirm_setup_intent: { label: "WC Setup Intent Confirm",         desc: "WooCommerce wc_stripe_create_and_confirm_setup_intent AJAX — verify-only, no charge.", needs: ["publicKey", "siteUrl"], optional: ["secretKey"] },
+    stripe_page_confirm:            { label: "Stripe Page Confirm",              desc: "Scrapes a Stripe-powered payment page and submits the card directly to it.", needs: ["publicKey", "siteUrl"], optional: ["secretKey"] },
   },
   shopify: {
     pci:      { label: "Shopify PCI Checkout",    desc: "Modern Shopify PCI flow: PCI tokenize → SubmitForCompletion GQL → PollForReceipt GQL × 2.", needs: ["siteUrl"], optional: ["checkoutScope", "productHandle"] },
@@ -2250,6 +2250,7 @@ export default function Configs() {
                     if (!flowMeta) return null;
                     const allFields = [
                       { key: "publicKey", label: "Stripe Public Key", placeholder: "pk_live_ or pk_test_...", gateTypes: ["stripe"] },
+                      { key: "secretKey", label: "Stripe Secret Key", placeholder: "sk_live_... (server-side)", gateTypes: ["stripe"] },
                       { key: "btClientToken", label: "Braintree Client Token", placeholder: "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiIs...", gateTypes: ["braintree"] },
                       { key: "btMerchantId", label: "Braintree Merchant ID", placeholder: "wdk3wg9ymdvp6gqq", gateTypes: ["braintree"] },
                       { key: "wcNonce", label: "WC Checkout Nonce", placeholder: "woocommerce-process-checkout-nonce value", gateTypes: ["stripe", "braintree", "paypal"] },
@@ -2570,6 +2571,7 @@ export default function Configs() {
                     <div className="space-y-2">
                       {[
                         { key: "publicKey",     label: "Stripe Public Key",        placeholder: "pk_live_…  or  pk_test_…" },
+                        { key: "secretKey",     label: "Stripe Secret Key",        placeholder: "sk_live_…  (server-side tokenization)" },
                         { key: "btClientToken", label: "Braintree Client Token",   placeholder: "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiIs…" },
                         { key: "btMerchantId",  label: "Braintree Merchant ID",    placeholder: "wdk3wg9ymdvp6gqq  (fallback if not in token)" },
                         { key: "stripeAccount", label: "Stripe Connected Account", placeholder: "acct_XXXXXXXXXXXX" },

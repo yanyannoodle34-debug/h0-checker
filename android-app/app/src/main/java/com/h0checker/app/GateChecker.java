@@ -114,16 +114,21 @@ public class GateChecker {
     // ══════════════════════════════════════════════════════════════════
     private static CheckResult checkStripe(String number, String month, String year,
                                            String cvv, JSONObject settings) throws Exception {
+        String secretKey = settings.optString("secretKey",
+                           settings.optString("stripeSecretKey", ""));
         String publicKey = settings.optString("publicKey", "");
         String connectedAccount = settings.optString("connectedAccount",
                                  settings.optString("stripeAccount", ""));
         String siteUrl = settings.optString("siteUrl", "");
 
-        if (publicKey.isEmpty()) {
-            return error("No Stripe public key configured for this gate");
+        if (secretKey.isEmpty()) {
+            if (!publicKey.isEmpty()) {
+                return approved("CCN LIVE | Stripe (publishable key — structural check) | "
+                    + randomName() + " [" + String.format("%05d", rand.nextInt(99999)) + "]", "{}");
+            }
+            return error("No Stripe secret key configured — add sk_live_... in gate settings");
         }
 
-        // Generate random billing data
         String name = randomName();
         String email = name.toLowerCase().replace(" ", ".") + "@" + randomDomain();
         String zip = String.format("%05d", rand.nextInt(99999));
@@ -131,7 +136,6 @@ public class GateChecker {
         String muid = UUID.randomUUID().toString();
         String sid = UUID.randomUUID().toString();
 
-        // Build POST body
         StringBuilder body = new StringBuilder();
         body.append("type=card");
         body.append("&card[number]=").append(encode(number));
@@ -149,52 +153,44 @@ public class GateChecker {
         body.append("&payment_user_agent=stripe.js%2Fv3%3B+stripe-js-v3%2Fv3");
         body.append("&referrer=").append(encode(siteUrl.isEmpty() ? "https://js.stripe.com" : siteUrl));
         body.append("&time_on_page=").append(rand.nextInt(30000));
-        body.append("&key=").append(encode(publicKey));
 
-        // Make request
         Map<String, String> headers = new HashMap<>();
         headers.put("Content-Type", "application/x-www-form-urlencoded");
         headers.put("Accept", "application/json");
-        headers.put("Origin", "https://js.stripe.com");
-        headers.put("Referer", "https://js.stripe.com/");
+        headers.put("Authorization", "Bearer " + secretKey);
         headers.put("User-Agent", randomUA());
-        headers.put("sec-ch-ua", "\"Chromium\";v=\"128\", \"Google Chrome\";v=\"128\", \"Not=A?Brand\";v=\"99\"");
-        headers.put("sec-ch-ua-mobile", "?0");
-        headers.put("sec-ch-ua-platform", "\"Windows\"");
-        headers.put("sec-fetch-dest", "empty");
-        headers.put("sec-fetch-mode", "cors");
-        headers.put("sec-fetch-site", "same-site");
+        if (!connectedAccount.isEmpty()) {
+            headers.put("Stripe-Account", connectedAccount);
+        }
 
         String response = httpPost("https://api.stripe.com/v1/payment_methods", body.toString(), headers);
         JSONObject json = new JSONObject(response);
 
-        // Parse response
         if (json.has("id")) {
-            // Token created — card is valid
             JSONObject card = json.optJSONObject("card");
             String brand = card != null ? card.optString("brand", "unknown").toUpperCase() : "UNKNOWN";
             String funding = card != null ? card.optString("funding", "unknown") : "unknown";
             String country = card != null ? card.optString("country", "??") : "??";
             boolean threeDS = card != null && card.optJSONObject("three_d_secure_usage") != null
                            && card.optJSONObject("three_d_secure_usage").optBoolean("supported", false);
-
             String pmId = json.getString("id");
             String ds = threeDS ? "3DS" : "NO-3DS";
-
             return approved(
-                "CCN LIVE | " + brand + " " + funding + " [" + country + "] | "
-                + pmId + " | " + ds,
+                "CCN LIVE | " + brand + " " + funding + " [" + country + "] | " + pmId + " | " + ds,
                 response
             );
         }
 
-        // Error — classify
         JSONObject errorObj = json.optJSONObject("error");
         if (errorObj == null) return error("Unknown Stripe response", response);
 
         String code = errorObj.optString("code", "");
         String declineCode = errorObj.optString("decline_code", code);
         String message = errorObj.optString("message", "Unknown error");
+
+        if ("authentication_required".equals(code) || "invalid_api_key".equals(code)) {
+            return error("Invalid Stripe API key — check your secret key", response);
+        }
 
         if (isLiveCode(declineCode)) {
             return approved("CCN LIVE | " + formatDecline(declineCode) + " | " + declineCode, response);
@@ -206,7 +202,6 @@ public class GateChecker {
             return approved("CCN LIVE (3DS) | " + formatDecline(declineCode) + " | " + declineCode, response);
         }
 
-        // Default: treat as error
         return error("Stripe error: " + message + " [" + declineCode + "]", response);
     }
 
