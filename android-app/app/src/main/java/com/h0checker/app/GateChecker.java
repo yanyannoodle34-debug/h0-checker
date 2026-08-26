@@ -1044,12 +1044,17 @@ public class GateChecker {
                 String mm = extractParam(body, "card[exp_month]");
                 String yy = extractParam(body, "card[exp_year]");
                 if (!num.isEmpty() && !cvv.isEmpty() && !mm.isEmpty() && !yy.isEmpty()) {
-                    String result = bridge.stripeTokenize(siteUrl, pk, num, mm, yy, cvv);
+                    String result = bridge.tokenize(siteUrl, pk, num, mm, yy, cvv);
+                    Log.i(TAG, "Bridge result: " + (result != null ? result.substring(0, Math.min(result.length(), 200)) : "null"));
                     return result;
+                } else {
+                    Log.w(TAG, "Could not extract card params from body, using httpPost fallback");
                 }
             } catch (Exception e) {
-                Log.e(TAG, "WebView Stripe call failed: " + e.getMessage());
+                Log.e(TAG, "WebView tokenize failed: " + e.getMessage());
             }
+        } else {
+            Log.w(TAG, "Bridge not available: bridge=" + (bridge != null) + " siteUrl=" + siteUrl + " pk=" + (pk != null && !pk.isEmpty()));
         }
         // Fallback to HttpURLConnection
         try {
