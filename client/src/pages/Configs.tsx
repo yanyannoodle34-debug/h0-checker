@@ -2255,7 +2255,12 @@ export default function Configs() {
                       { key: "btMerchantId", label: "Braintree Merchant ID", placeholder: "wdk3wg9ymdvp6gqq", gateTypes: ["braintree"] },
                       { key: "wcNonce", label: "WC Checkout Nonce", placeholder: "woocommerce-process-checkout-nonce value", gateTypes: ["stripe", "braintree", "paypal"] },
                       { key: "stripeAccount", label: "Stripe Connected Account", placeholder: "acct_XXXXXXXXXXXX", gateTypes: ["stripe"] },
-                      { key: "siteUrl", label: "Site URL", placeholder: "https://example.com", gateTypes: ["stripe", "shopify", "braintree", "paypal", "payeezy"], isGateUrl: true },
+                      { key: "siteUrl", label: "Site URL", placeholder: "https://example.com", gateTypes: ["stripe", "shopify", "braintree", "paypal", "payeezy", "adyen"], isGateUrl: true },
+                      { key: "clientKey", label: "Adyen Client Key", placeholder: "AQEyhmfxK4PJahc0w0...", gateTypes: ["adyen"] },
+                      { key: "merchantAccount", label: "Adyen Merchant Account", placeholder: "YourCompanyECOM", gateTypes: ["adyen"] },
+                      { key: "checkoutUrl", label: "Adyen Checkout URL", placeholder: "https://checkout-api.adyen.com/v71/payments", gateTypes: ["adyen"] },
+                      { key: "clientId", label: "PayPal Client ID", placeholder: "AeA... (auto-scraped if empty)", gateTypes: ["paypal"] },
+                      { key: "addPmPath", label: "Add PM Path", placeholder: "/my-account/add-payment-method/", gateTypes: ["payeezy"] },
                     ];
                     const required = allFields.filter(f => flowMeta.needs.includes(f.key) && f.gateTypes.includes(editGate.gateType));
                     const optional = allFields.filter(f => (flowMeta.optional || []).includes(f.key) && f.gateTypes.includes(editGate.gateType));
@@ -2575,6 +2580,11 @@ export default function Configs() {
                         { key: "btClientToken", label: "Braintree Client Token",   placeholder: "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiIs…" },
                         { key: "btMerchantId",  label: "Braintree Merchant ID",    placeholder: "wdk3wg9ymdvp6gqq  (fallback if not in token)" },
                         { key: "stripeAccount", label: "Stripe Connected Account", placeholder: "acct_XXXXXXXXXXXX" },
+                        { key: "clientKey",     label: "Adyen Client Key",         placeholder: "AQEyhmfxK4PJahc0w0…" },
+                        { key: "merchantAccount", label: "Adyen Merchant Account",  placeholder: "YourCompanyECOM" },
+                        { key: "checkoutUrl",   label: "Adyen Checkout URL",       placeholder: "https://checkout-api.adyen.com/v71/payments" },
+                        { key: "clientId",      label: "PayPal Client ID",         placeholder: "AeA… (auto-scraped if empty)" },
+                        { key: "addPmPath",     label: "Add PM Path (Payeezy)",    placeholder: "/my-account/add-payment-method/" },
                       ].map(({ key, label, placeholder }) => (
                         <div key={key} className="space-y-1">
                           <Label className="text-[10px] font-mono text-muted-foreground/80">{label}</Label>
